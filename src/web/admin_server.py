@@ -1,0 +1,488 @@
+"""独立管理后台 HTTP 服务（与 wework-external-bot 分进程）。"""
+
+from __future__ import annotations
+
+import json
+import logging
+import mimetypes
+import threading
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import unquote, urlparse
+
+from config.settings import PROJECT_ROOT, settings
+from src.storage.db import ExternalGroupStore
+from src.web import admin_auth
+from src.web.admin_api import handle_admin_api
+
+logger = logging.getLogger(__name__)
+
+ADMIN_STATIC_ROOT = PROJECT_ROOT / "static" / "admin"
+
+# 无需 Cookie 的 API
+_PUBLIC_API = frozenset({"login", "logout", "me"})
+
+_THUMB_MAX = (160, 100)
+_THUMB_QUALITY = 70
+_CACHE_THUMB = "private, max-age=86400"
+_CACHE_ORIGINAL = "private, no-cache"
+
+
+def job_screenshot_thumb_path(src: Path) -> Path:
+    """原图旁的 JPEG 缩略图路径（例如 foo.png.thumb.jpg）。"""
+    return Path(str(src) + ".thumb.jpg")
+
+
+def ensure_job_screenshot_thumb(src: Path) -> Path:
+    """生成或复用列表用 JPEG 缩略图；原图 mtime 更新则重建。"""
+    dest = job_screenshot_thumb_path(src)
+    st = src.stat()
+    if dest.is_file():
+        dt = dest.stat()
+        if dt.st_mtime >= st.st_mtime and dt.st_size > 0:
+            return dest
+    from PIL import Image
+
+    with Image.open(src) as im:
+        rgb = im.convert("RGB")
+        rgb.thumbnail(_THUMB_MAX)
+        rgb.save(dest, "JPEG", quality=_THUMB_QUALITY, optimize=True)
+    return dest
+
+
+def read_job_screenshot_file(
+    src: Path, *, thumb: bool
+) -> tuple[bytes, str, str, str]:
+    """读取截图文件。
+
+    返回 (bytes, content_type, cache_control, filename_suffix)。
+    thumb=True 时出 JPEG 缩略图并允许浏览器缓存；失败则回退原 PNG + no-cache。
+    """
+    if thumb:
+        try:
+            dest = ensure_job_screenshot_thumb(src)
+            return (
+                dest.read_bytes(),
+                "image/jpeg",
+                _CACHE_THUMB,
+                ".thumb.jpg",
+            )
+        except Exception:
+            logger.exception("列表缩略图生成失败，回退原图: %s", src)
+    return src.read_bytes(), "image/png", _CACHE_ORIGINAL, ".png"
+
+
+@dataclass
+class AdminWebServer:
+    """仅托管 React SPA + /admin/api + 轻量 /health。"""
+
+    store: ExternalGroupStore = field(default_factory=ExternalGroupStore)
+    host: str = "0.0.0.0"
+    port: int = 8082
+    icris_worker: Any = None
+
+    def start(self, *, blocking: bool = True) -> None:
+        store = self.store
+        port = self.port
+        host = self.host
+        icris_worker = self.icris_worker
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: Any) -> None:
+                logger.debug("HTTP %s", fmt % args)
+
+            def _send_html(self, html: str, code: int = 200) -> None:
+                body = html.encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _send_json(
+                self,
+                data: dict,
+                code: int = 200,
+                *,
+                extra_headers: list[tuple[str, str]] | None = None,
+            ) -> None:
+                body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                for k, v in extra_headers or []:
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _read_body(self, *, max_bytes: int = 1_000_000) -> bytes:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                if length <= 0:
+                    return b""
+                return self.rfile.read(min(length, max_bytes))
+
+            def _api_rel(self, path: str) -> str:
+                parsed = urlparse(path)
+                raw = (parsed.path or "").rstrip("/") or "/"
+                if not raw.startswith("/admin/api"):
+                    return ""
+                return raw[len("/admin/api") :].lstrip("/")
+
+            def _require_session(self) -> str | None:
+                user = admin_auth.username_from_request(self.headers)
+                if not user:
+                    self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                    return None
+                return user
+
+            def _handle_health(self) -> None:
+                self._send_json(
+                    {
+                        "ok": True,
+                        "service": "finance-ai-admin",
+                        "port": port,
+                        "static_ready": (ADMIN_STATIC_ROOT / "index.html").is_file(),
+                    }
+                )
+
+            def _handle_auth_api(self, method: str, rel: str) -> bool:
+                """处理 login/logout/me。已处理返回 True。"""
+                if rel == "me" and method == "GET":
+                    user = admin_auth.username_from_request(self.headers)
+                    if user:
+                        self._send_json(
+                            {"ok": True, "authenticated": True, "username": user}
+                        )
+                    else:
+                        self._send_json(
+                            {"ok": True, "authenticated": False, "username": ""}
+                        )
+                    return True
+                if rel == "logout" and method == "POST":
+                    self._send_json(
+                        {"ok": True},
+                        200,
+                        extra_headers=[
+                            ("Set-Cookie", admin_auth.clear_session_cookie_header())
+                        ],
+                    )
+                    return True
+                if rel == "login" and method == "POST":
+                    body = admin_auth.read_json_body(self._read_body())
+                    username = str(body.get("username") or "")
+                    password = str(body.get("password") or "")
+                    ok, err = admin_auth.verify_credentials(username, password)
+                    if not ok:
+                        self._send_json({"ok": False, "error": err}, 401)
+                        return True
+                    token = admin_auth.issue_session_token(username)
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "username": admin_auth.expected_username(),
+                        },
+                        200,
+                        extra_headers=[
+                            ("Set-Cookie", admin_auth.session_cookie_header(token))
+                        ],
+                    )
+                    return True
+                return False
+
+            def _handle_job_screenshot(
+                self, store: ExternalGroupStore, rel: str
+            ) -> None:
+                """读取 job 截图。默认 image/png + no-cache；?thumb=1 为列表 JPEG 缩略图。
+
+                rel: jobs/<id>/screenshot
+                query: ?type=esubmit|success|fail|form|activation（默认 fail）
+                """
+                import re
+                from urllib.parse import parse_qs
+
+                m = re.match(r"jobs/(\d+)/screenshot$", rel)
+                if not m:
+                    return self._send_json(
+                        {"ok": False, "error": "invalid screenshot path"}, 400
+                    )
+                job_id = int(m.group(1))
+                qs = urlparse(self.path).query or ""
+                q = parse_qs(qs)
+                shot_type = (q.get("type", ["fail"]) or ["fail"])[0].lower()
+                want_thumb = (q.get("thumb", ["0"]) or ["0"])[0].lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                )
+
+                found, file_path = store.get_job_screenshot_path(job_id, shot_type)
+                if not found:
+                    return self._send_json({"ok": False, "error": "job not found"}, 404)
+
+                if not file_path:
+                    return self._send_json(
+                        {
+                            "ok": False,
+                            "error": f"no {shot_type} screenshot for job #{job_id}",
+                        },
+                        404,
+                    )
+
+                p = Path(file_path)
+                if not p.is_file():
+                    return self._send_json(
+                        {"ok": False, "error": "screenshot file missing on disk"},
+                        404,
+                    )
+
+                data, content_type, cache_control, suffix = read_job_screenshot_file(
+                    p, thumb=want_thumb
+                )
+                safe_type = re.sub(r"[^a-z0-9_-]", "", shot_type) or "fail"
+                st = p.stat()
+                etag_kind = "thumb" if want_thumb and suffix.endswith(".jpg") else "full"
+                etag = (
+                    f'"{job_id}-{safe_type}-{etag_kind}-{int(st.st_mtime)}-{len(data)}"'
+                )
+                inm = (self.headers.get("If-None-Match") or "").strip()
+                if inm == etag or inm == f"W/{etag}":
+                    self.send_response(304)
+                    self.send_header("ETag", etag)
+                    self.send_header("Cache-Control", cache_control)
+                    self.end_headers()
+                    return
+
+                filename = f"job-{job_id}-{safe_type}{suffix}"
+                as_download = (q.get("download", ["0"]) or ["0"])[0].lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                )
+                disposition = "attachment" if as_download else "inline"
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header(
+                    "Content-Disposition",
+                    f'{disposition}; filename="{filename}"',
+                )
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", cache_control)
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self) -> None:
+                path = urlparse(self.path).path
+                if path in ("/health", "/healthz"):
+                    return self._handle_health()
+                if path == "/" or path == "":
+                    self.send_response(302)
+                    self.send_header("Location", "/admin/")
+                    self.end_headers()
+                    return
+                if path.startswith("/admin/api"):
+                    rel = self._api_rel(self.path)
+                    if rel in _PUBLIC_API:
+                        if self._handle_auth_api("GET", rel):
+                            return
+                    else:
+                        if not self._require_session():
+                            return
+                    # 截图接口：返回二进制 image/png，不走 JSON admin_api
+                    if rel.startswith("jobs/") and rel.endswith("/screenshot"):
+                        return self._handle_job_screenshot(store, rel)
+                    result = handle_admin_api(
+                        method="GET",
+                        path=self.path,
+                        store=store,
+                        icris_worker=icris_worker,
+                    )
+                    if result is None:
+                        return self._send_json({"ok": False, "error": "not found"}, 404)
+                    data, code = result
+                    return self._send_json(data, code)
+                if path.startswith("/admin"):
+                    # SPA 静态资源匿名可访问（登录页需加载）
+                    return self._handle_admin_spa(path)
+                self.send_response(404)
+                self.end_headers()
+
+            def do_POST(self) -> None:
+                path = urlparse(self.path).path
+                if path.startswith("/admin/api"):
+                    rel = self._api_rel(self.path)
+                    if rel in _PUBLIC_API:
+                        if self._handle_auth_api("POST", rel):
+                            return
+                        return self._send_json({"ok": False, "error": "not found"}, 404)
+                    if not self._require_session():
+                        return
+                    # 默认读 JSON body（1MB）；证件/提交类接口允许 30MB
+                    body: dict | None = None
+                    if rel in (
+                        "register-runner/submit",
+                        "register-runner/extract-id",
+                        "id-extract",
+                    ):
+                        raw = self._read_body(max_bytes=30_000_000)
+                    else:
+                        raw = self._read_body()
+                    if raw:
+                        try:
+                            parsed = json.loads(raw.decode("utf-8"))
+                        except Exception:
+                            return self._send_json(
+                                {"ok": False, "error": "invalid json body"}, 400
+                            )
+                        if not isinstance(parsed, dict):
+                            return self._send_json(
+                                {"ok": False, "error": "invalid json body"}, 400
+                            )
+                        body = parsed
+                    result = handle_admin_api(
+                        method="POST",
+                        path=self.path,
+                        store=store,
+                        icris_worker=icris_worker,
+                        body=body,
+                    )
+                    if result is None:
+                        return self._send_json({"ok": False, "error": "not found"}, 404)
+                    data, code = result
+                    return self._send_json(data, code)
+                self.send_response(404)
+                self.end_headers()
+
+            def do_PUT(self) -> None:
+                path = urlparse(self.path).path
+                if path.startswith("/admin/api"):
+                    rel = self._api_rel(self.path)
+                    if rel in _PUBLIC_API:
+                        return self._send_json(
+                            {"ok": False, "error": "not found"}, 404
+                        )
+                    if not self._require_session():
+                        return
+                    raw = self._read_body()
+                    body: dict | None = None
+                    if raw:
+                        try:
+                            parsed = json.loads(raw.decode("utf-8"))
+                        except Exception:
+                            return self._send_json(
+                                {"ok": False, "error": "invalid json body"}, 400
+                            )
+                        if not isinstance(parsed, dict):
+                            return self._send_json(
+                                {"ok": False, "error": "invalid json body"}, 400
+                            )
+                        body = parsed
+                    result = handle_admin_api(
+                        method="PUT",
+                        path=self.path,
+                        store=store,
+                        icris_worker=icris_worker,
+                        body=body,
+                    )
+                    if result is None:
+                        return self._send_json(
+                            {"ok": False, "error": "not found"}, 404
+                        )
+                    data, code = result
+                    return self._send_json(data, code)
+                self.send_response(404)
+                self.end_headers()
+
+            def do_DELETE(self) -> None:
+                path = urlparse(self.path).path
+                if path.startswith("/admin/api"):
+                    rel = self._api_rel(self.path)
+                    if rel in _PUBLIC_API:
+                        return self._send_json(
+                            {"ok": False, "error": "not found"}, 404
+                        )
+                    if not self._require_session():
+                        return
+                    result = handle_admin_api(
+                        method="DELETE",
+                        path=self.path,
+                        store=store,
+                        icris_worker=icris_worker,
+                    )
+                    if result is None:
+                        return self._send_json(
+                            {"ok": False, "error": "not found"}, 404
+                        )
+                    data, code = result
+                    return self._send_json(data, code)
+                self.send_response(404)
+                self.end_headers()
+
+            def _handle_admin_spa(self, path: str) -> None:
+                root = ADMIN_STATIC_ROOT.resolve()
+                if not root.is_dir():
+                    return self._send_html(
+                        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                        "<title>Admin not built</title></head><body>"
+                        "<h1>管理后台前端未构建</h1>"
+                        "<p>请执行：</p>"
+                        "<pre>cd web/admin\nnpm install\nnpm run build</pre>"
+                        "<p>产物应位于 <code>static/admin/</code></p>"
+                        "</body></html>",
+                        503,
+                    )
+                rel = path[len("/admin") :].lstrip("/")
+                if not rel or rel.endswith("/"):
+                    candidate = root / "index.html"
+                else:
+                    candidate = (root / unquote(rel)).resolve()
+                    if not str(candidate).startswith(str(root)):
+                        self.send_response(403)
+                        self.end_headers()
+                        return
+                    if not candidate.is_file():
+                        candidate = root / "index.html"
+                if not candidate.is_file():
+                    return self._send_html(
+                        "<h1>Admin index missing</h1>"
+                        "<p>Run <code>npm run build</code> in web/admin</p>",
+                        503,
+                    )
+                data = candidate.read_bytes()
+                ctype, _ = mimetypes.guess_type(str(candidate))
+                if not ctype:
+                    ctype = "application/octet-stream"
+                if candidate.name.endswith(".html"):
+                    ctype = "text/html; charset=utf-8"
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                if candidate.suffix in (".js", ".css", ".woff2", ".woff"):
+                    self.send_header("Cache-Control", "public, max-age=86400")
+                else:
+                    self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(data)
+
+        class AdminHTTPServer(ThreadingHTTPServer):
+            """Windows 下默认 SO_REUSEADDR 会与旧进程静默共享端口，导致请求打到旧代码；
+            关闭后端口被占时第二个实例启动即报错。"""
+
+            allow_reuse_address = False
+
+        server = AdminHTTPServer((host, port), Handler)
+        logger.info(
+            "[Admin] 已启动 http://%s:%s/admin （登录页；需 ADMIN_PASSWORD；静态目录 %s）",
+            host,
+            port,
+            ADMIN_STATIC_ROOT,
+        )
+        if blocking:
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                server.shutdown()
+        else:
+            threading.Thread(target=server.serve_forever, daemon=True).start()

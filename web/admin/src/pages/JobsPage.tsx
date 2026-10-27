@@ -1,0 +1,959 @@
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Link } from "react-router-dom";
+import { api, type JobField, type JobRow } from "../api";
+import { formatDateTime } from "../format";
+import { StateBox, JobPipelineLights, jobCanCancel, jobCanDelete, jobCanFormRetry, jobCanRequeue, jobProgressTagColor, jobProgressTooltip } from "../components/ui";
+import { DraggableShot, jobShotFilename } from "../components/DraggableShot";
+import { activationWaitHint, isActivationMailStuck } from "../jobTimeline";
+import {
+  Alert,
+  Button,
+  Card,
+  DatePicker,
+  Input,
+  Modal,
+  Select,
+  Space,
+  Table,
+  Tag,
+  Tooltip,
+} from "antd";
+import { CopyOutlined, SearchOutlined, ReloadOutlined, FolderOpenOutlined } from "@ant-design/icons";
+import dayjs from "dayjs";
+import {
+  clearStoredDirectory,
+  directoryName,
+  ensureWritePermission,
+  isDirectoryPickerSupported,
+  loadStoredDirectory,
+  pickDirectory,
+  type ShotDirHandle,
+} from "../lib/saveFolder";
+import { useMessageApi } from "../useMessageApi";
+
+type Props = {
+  refreshKey: number;
+  onRefresh: () => void;
+};
+
+const POLL_SEC = 10;
+const PAGE_SIZE = 10;
+
+type ListShotType = "esubmit" | "success" | "activation" | "form";
+
+function shotCacheV(path?: string, updatedAt?: string): string {
+  const name = (path || "").replace(/\\/g, "/").split("/").pop() || "";
+  return name || updatedAt || "";
+}
+
+function listShotUrls(r: JobRow, type: ListShotType) {
+  const path =
+    type === "esubmit"
+      ? r.esubmit_screenshot_path
+      : type === "success"
+        ? r.success_screenshot_path
+        : type === "activation"
+          ? r.activation_screenshot_path
+          : r.form_screenshot_path;
+  const v = shotCacheV(path, r.updated_at);
+  return {
+    src: api.jobScreenshotUrl(r.id, type),
+    thumbSrc: api.jobScreenshotUrl(r.id, type, { thumb: true, v }),
+  };
+}
+
+function JobsRefreshButton({
+  pollSec,
+  resetKey,
+  onSilent,
+  onManual,
+}: {
+  pollSec: number;
+  resetKey: string;
+  onSilent: () => void;
+  onManual: () => void;
+}) {
+  const [countdown, setCountdown] = useState(pollSec);
+  const silentRef = useRef(onSilent);
+  silentRef.current = onSilent;
+
+  useEffect(() => {
+    setCountdown(pollSec);
+  }, [resetKey, pollSec]);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setCountdown((c) => {
+        if (c <= 1) {
+          silentRef.current();
+          return pollSec;
+        }
+        return c - 1;
+      });
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [pollSec, resetKey]);
+
+  return (
+    <Button
+      icon={<ReloadOutlined />}
+      onClick={() => {
+        setCountdown(pollSec);
+        onManual();
+      }}
+    >
+      刷新 {countdown}s
+    </Button>
+  );
+}
+
+async function copyText(text: string): Promise<boolean> {
+  const cleaned = (text || "").trim();
+  if (!cleaned) return false;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(cleaned);
+      return true;
+    }
+  } catch {
+    /* fall through */
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = cleaned;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+const STATUS_OPTIONS = [
+  { value: "", label: "全部" },
+  { value: "queued", label: "排队" },
+  { value: "registering", label: "注册中" },
+  { value: "review", label: "待审核" },
+  { value: "review_rejected", label: "已拒绝" },
+  { value: "failed", label: "已失败" },
+  { value: "cancelled", label: "已取消" },
+  { value: "registered", label: "注册完成" },
+  { value: "activation_pending", label: "待激活" },
+  { value: "activating", label: "激活中" },
+  { value: "activation_failed", label: "激活失败" },
+  { value: "activated", label: "已激活" },
+  { value: "form_pending", label: "待填表" },
+  { value: "form_failed", label: "填表失败" },
+  { value: "form_filled", label: "已填表" },
+];
+
+function JobExpandRow({ job }: { job: JobRow }) {
+  const [fields, setFields] = useState<JobField[] | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    api
+      .job(job.id)
+      .then((d) => {
+        if (alive) setFields(d.fields || []);
+      })
+      .catch(() => {
+        if (alive) setFields([]);
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [job.id]);
+
+  return (
+    <div className="job-expand">
+      <JobPipelineLights
+        progress={job.progress}
+        hint={activationWaitHint(job)}
+        warnCurrent={isActivationMailStuck(job)}
+      />
+      <div className="job-expand-meta">
+        来源 {job.source || "-"}
+        {" · "}
+        尝试 {job.attempts ?? 0}/{job.max_attempts ?? 0}
+        {" · "}
+        dry/submit {job.dry_run ? "Y" : "N"}/{job.allow_submit ? "Y" : "N"}
+      </div>
+      {loading ? (
+        <p className="muted">字段加载中…</p>
+      ) : fields?.length ? (
+        <dl className="job-expand-fields">
+          {fields.map((f) => (
+            <div key={f.key}>
+              <dt>{f.label || f.key}</dt>
+              <dd>{f.value}</dd>
+            </div>
+          ))}
+        </dl>
+      ) : (
+        <p className="muted">无字段快照</p>
+      )}
+    </div>
+  );
+}
+
+export function JobsPage({ refreshKey, onRefresh }: Props) {
+  const message = useMessageApi();
+  const [status, setStatus] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [items, setItems] = useState<JobRow[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [busyId, setBusyId] = useState<number | null>(null);
+  const sortKey = "id" as const;
+  const sortAsc = false;
+  // 搜索条件（实际触发查询的值）
+  const [companyName, setCompanyName] = useState("");
+  const [directorName, setDirectorName] = useState("");
+  const [idNumber, setIdNumber] = useState("");
+  const [dateRange, setDateRange] = useState<[dayjs.Dayjs | null, dayjs.Dayjs | null] | null>(null);
+  // 输入框值（点搜索才同步）
+  const [companyInput, setCompanyInput] = useState("");
+  const [directorInput, setDirectorInput] = useState("");
+  const [idInput, setIdInput] = useState("");
+  const folderOk = isDirectoryPickerSupported();
+  const [saveDir, setSaveDir] = useState<ShotDirHandle | null>(null);
+  const [zoneHover, setZoneHover] = useState(false);
+  const zoneRef = useRef<HTMLDivElement | null>(null);
+  const [zoneEl, setZoneEl] = useState<HTMLDivElement | null>(null);
+  const loadGen = useRef(0);
+
+  const loadJobs = useCallback(async (opts?: { silent?: boolean }) => {
+    const silent = Boolean(opts?.silent);
+    const gen = ++loadGen.current;
+    if (!silent) {
+      setLoading(true);
+      setError(null);
+    }
+    const dateFrom = dateRange?.[0]?.format("YYYY-MM-DD") || "";
+    const dateTo = dateRange?.[1]?.format("YYYY-MM-DD") || "";
+    const offset = (page - 1) * PAGE_SIZE;
+    try {
+      const d = await api.jobs(
+        status,
+        PAGE_SIZE,
+        "",
+        dateFrom,
+        dateTo,
+        companyName,
+        directorName,
+        idNumber,
+        offset,
+      );
+      if (gen !== loadGen.current) return;
+      const rows = d.items || [];
+      const all = Number(d.total || 0);
+      if (rows.length === 0 && all > 0 && page > 1) {
+        const last = Math.max(1, Math.ceil(all / PAGE_SIZE));
+        setPage(last);
+        return;
+      }
+      setItems(rows);
+      setTotal(all);
+      if (!silent) setError(null);
+    } catch (e) {
+      if (gen !== loadGen.current) return;
+      if (!silent) setError((e as Error).message);
+    } finally {
+      if (gen === loadGen.current && !silent) setLoading(false);
+    }
+  }, [status, companyName, directorName, idNumber, dateRange, page]);
+
+  const silentReload = useCallback(() => {
+    void loadJobs({ silent: true });
+  }, [loadJobs]);
+
+  useEffect(() => {
+    void loadJobs({ silent: false });
+  }, [loadJobs, refreshKey]);
+
+  useEffect(() => {
+    let alive = true;
+    if (!folderOk) return;
+    loadStoredDirectory().then((handle) => {
+      if (alive && handle) setSaveDir(handle);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [folderOk]);
+
+  useEffect(() => {
+    if (!saveDir) return;
+    const grant = () => {
+      void ensureWritePermission(saveDir);
+    };
+    window.addEventListener("pointerdown", grant, { capture: true, once: true });
+    return () => window.removeEventListener("pointerdown", grant, { capture: true });
+  }, [saveDir]);
+
+  const pickSaveFolder = useCallback(async (): Promise<ShotDirHandle | null> => {
+    try {
+      const handle = await pickDirectory();
+      if (handle) setSaveDir(handle);
+      return handle;
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : "选择文件夹失败");
+      return null;
+    }
+  }, []);
+
+  const clearSaveFolder = useCallback(() => {
+    setSaveDir(null);
+    void clearStoredDirectory();
+    message.success("已清除保存文件夹");
+  }, []);
+
+  const onHoverZone = useCallback((hover: boolean) => {
+    setZoneHover(hover);
+  }, []);
+
+  const setZone = useCallback((el: HTMLDivElement | null) => {
+    zoneRef.current = el;
+    setZoneEl(el);
+  }, []);
+
+  const sorted = useMemo(() => {
+    const copy = [...items];
+    copy.sort((a, b) => {
+      const av = String(a[sortKey] ?? "");
+      const bv = String(b[sortKey] ?? "");
+      if (sortKey === "id") {
+        return sortAsc ? a.id - b.id : b.id - a.id;
+      }
+      return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
+    });
+    return copy;
+  }, [items, sortKey, sortAsc]);
+
+  const tableHoldRef = useRef<HTMLDivElement>(null);
+  const [bodyY, setBodyY] = useState<number>();
+  useLayoutEffect(() => {
+    const el = tableHoldRef.current;
+    if (!el) return;
+    const measure = () => {
+      const pag = el.querySelector(".ant-table-pagination") as HTMLElement | null;
+      const header =
+        (el.querySelector(".ant-table-header") as HTMLElement | null) ||
+        (el.querySelector(".ant-table-thead") as HTMLElement | null);
+      const pagH = pag ? pag.offsetHeight + 12 : 56;
+      const headerH = header?.offsetHeight ?? 40;
+      setBodyY(Math.max(120, el.clientHeight - pagH - headerH - 12));
+    };
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    measure();
+    return () => ro.disconnect();
+  }, [loading, sorted.length]);
+
+  function onSearch() {
+    setPage(1);
+    setCompanyName(companyInput.trim());
+    setDirectorName(directorInput.trim());
+    setIdNumber(idInput.trim());
+  }
+
+  function onReset() {
+    setCompanyInput("");
+    setDirectorInput("");
+    setIdInput("");
+    setDateRange(null);
+    setStatus("");
+    setCompanyName("");
+    setDirectorName("");
+    setIdNumber("");
+    setPage(1);
+  }
+
+  function onManualRefresh() {
+    void loadJobs({ silent: false });
+  }
+
+  const runAct = useCallback(async (
+    id: number,
+    kind: "cancel" | "requeue" | "approve" | "reject" | "formRetry" | "delete",
+  ) => {
+    const labelMap: Record<typeof kind, string> = {
+      cancel: "取消",
+      requeue: "重跑",
+      approve: "提交审核",
+      reject: "拒绝审核",
+      formRetry: "重跑填表",
+      delete: "删除",
+    };
+    const label = labelMap[kind];
+    setBusyId(id);
+    try {
+      let res: { message?: string } | null = null;
+      if (kind === "cancel") res = await api.cancelJob(id);
+      else if (kind === "requeue") res = await api.requeueJob(id);
+      else if (kind === "approve") res = await api.approveJob(id);
+      else if (kind === "reject") res = await api.rejectJob(id);
+      else if (kind === "formRetry") res = await api.formRetryJob(id);
+      else if (kind === "delete") res = await api.deleteJob(id);
+      message.success(res?.message || `${label}成功`);
+      onRefresh();
+    } catch (e) {
+      message.error((e as Error).message || `${label}失败`);
+    } finally {
+      setBusyId(null);
+    }
+  }, [message, onRefresh]);
+
+  const act = useCallback((
+    id: number,
+    kind: "cancel" | "requeue" | "approve" | "reject" | "formRetry" | "delete",
+  ) => {
+    if (kind === "approve") {
+      Modal.confirm({
+        title: "确认提交？",
+        content: `确认提交任务 #${id}？审核通过后将继续 ICRIS 注册。`,
+        okText: "提交",
+        cancelText: "取消",
+        onOk: () => runAct(id, "approve"),
+      });
+      return;
+    }
+    if (kind === "reject") {
+      Modal.confirm({
+        title: "确认拒绝？",
+        content: `确认拒绝任务 #${id}？任务将标记为已拒绝，不会自动重跑。`,
+        okText: "拒绝",
+        okButtonProps: { danger: true },
+        cancelText: "取消",
+        onOk: () => runAct(id, "reject"),
+      });
+      return;
+    }
+    if (kind === "cancel") {
+      Modal.confirm({
+        title: "确认取消？",
+        content: `确认取消任务 #${id}？进行中的浏览器填表会立即停止。`,
+        okText: "取消任务",
+        okButtonProps: { danger: true },
+        cancelText: "返回",
+        onOk: () => runAct(id, "cancel"),
+      });
+      return;
+    }
+    if (kind === "formRetry") {
+      Modal.confirm({
+        title: "确认重跑填表？",
+        content: `确认重跑填表任务 #${id}？`,
+        okText: "重跑填表",
+        cancelText: "取消",
+        onOk: () => runAct(id, "formRetry"),
+      });
+      return;
+    }
+    if (kind === "delete") {
+      Modal.confirm({
+        title: "确认删除？",
+        content: `确认删除任务 #${id}？列表将不再显示，不可恢复。`,
+        okText: "删除",
+        okButtonProps: { danger: true },
+        cancelText: "取消",
+        onOk: () => runAct(id, "delete"),
+      });
+      return;
+    }
+    Modal.confirm({
+      title: "确认重跑？",
+      content: `确认重跑任务 #${id}？`,
+      okText: "重跑",
+      cancelText: "取消",
+      onOk: () => runAct(id, "requeue"),
+    });
+  }, [runAct]);
+
+  const columns = useMemo(() => [
+    {
+      title: "ID",
+      dataIndex: "id",
+      key: "id",
+      width: 80,
+      fixed: "left" as const,
+      render: (id: number) => (
+        <Link to={`/jobs/${id}`} onClick={(e) => e.stopPropagation()}>
+          #{id}
+        </Link>
+      ),
+    },
+    {
+      title: "公司名称",
+      key: "company_name",
+      width: 200,
+      render: (_: unknown, r: JobRow) => {
+        const en = (r.company_name_en || "").trim();
+        const cn = (r.company_name_cn || r.company_name || "").trim();
+        if (!en && !cn) return "-";
+        if (en && cn) {
+          return (
+            <div className="job-company-name">
+              <div>{en}</div>
+              <div className="muted">{cn}</div>
+            </div>
+          );
+        }
+        return en || cn;
+      },
+    },
+    {
+      title: "姓名",
+      dataIndex: "director_name",
+      key: "director_name",
+      width: 80,
+      ellipsis: { showTitle: false },
+      onHeaderCell: () => ({ style: { maxWidth: 80 } }),
+      onCell: () => ({ style: { maxWidth: 80 } }),
+      render: (v: string) => {
+        const name = (v || "").trim() || "-";
+        return (
+          <Tooltip title={name === "-" ? "" : name}>
+            <span className="job-director-name">{name}</span>
+          </Tooltip>
+        );
+      },
+    },
+    {
+      title: "证件类型",
+      dataIndex: "id_type",
+      key: "id_type",
+      width: 100,
+      render: (v: string) => v || "-",
+    },
+    {
+      title: "证件号码",
+      dataIndex: "id_number",
+      key: "id_number",
+      width: 180,
+      render: (v: string, r: JobRow) => (
+        <div>
+          <span className="mono">{v || "-"}</span>
+          {Number(r.id_already_registered) ? (
+            <div>
+              <Tag color="error" style={{ marginTop: 4 }}>
+                已被注册
+              </Tag>
+            </div>
+          ) : null}
+        </div>
+      ),
+    },
+    {
+      title: "账号",
+      key: "icris_account",
+      width: 200,
+      render: (_: unknown, r: JobRow) => {
+        const user = (r.icris_username || "").trim();
+        const pass = (r.icris_password || "").trim();
+        if (!user && !pass) return "-";
+        const copyLine = async (value: string, label: string) => {
+          const ok = await copyText(value);
+          if (ok) message.success(`已复制${label}`);
+          else message.error(`复制${label}失败`);
+        };
+        const line = (value: string, label: string) => (
+          <div className="job-cred-row">
+            <span className="mono">{value}</span>
+            <Tooltip title={`复制${label}`}>
+              <Button
+                type="text"
+                size="small"
+                className="job-cred-copy"
+                icon={<CopyOutlined />}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void copyLine(value, label);
+                }}
+              />
+            </Tooltip>
+          </div>
+        );
+        return (
+          <div className="job-cred-stack">
+            {user ? line(user, "用户名") : null}
+            {pass ? line(pass, "密码") : null}
+          </div>
+        );
+      },
+    },
+    {
+      title: "状态",
+      key: "status",
+      width: 130,
+      onHeaderCell: () => ({ style: { maxWidth: 130 } }),
+      onCell: () => ({ style: { maxWidth: 130 } }),
+      render: (_: unknown, r: JobRow) => {
+        const wait = activationWaitHint(r);
+        const stuck = isActivationMailStuck(r);
+        return (
+          <Tooltip
+            title={
+              <span style={{ whiteSpace: "pre-line" }}>
+                {jobProgressTooltip(r.progress)}
+                {wait ? `\n${wait}` : ""}
+              </span>
+            }
+          >
+            <div>
+              <Tag color={stuck ? "warning" : jobProgressTagColor(r.progress)}>
+                {r.progress?.label || "-"}
+              </Tag>
+              {wait ? (
+                <div className={`job-wait-hint${stuck ? " is-warn" : ""}`}>
+                  {wait}
+                </div>
+              ) : null}
+            </div>
+          </Tooltip>
+        );
+      },
+    },
+    {
+      title: "核对截图",
+      key: "esubmit_screenshot",
+      width: 120,
+      render: (_: unknown, r: JobRow) =>
+        r.esubmit_screenshot_path ? (
+          <DraggableShot
+            {...listShotUrls(r, "esubmit")}
+            filename={jobShotFilename(r.id, "esubmit")}
+            dir={saveDir}
+            zoneEl={zoneEl}
+            ensureFolder={pickSaveFolder}
+            onSaved={(name) => message.success(`已保存 ${name}`)}
+            onError={(msg) => message.error(msg)}
+            onHoverZone={onHoverZone}
+          />
+        ) : (
+          "-"
+        ),
+    },
+    {
+      title: "成功截图",
+      key: "success_screenshot",
+      width: 120,
+      render: (_: unknown, r: JobRow) =>
+        r.success_screenshot_path ? (
+          <DraggableShot
+            {...listShotUrls(r, "success")}
+            filename={jobShotFilename(r.id, "success")}
+            dir={saveDir}
+            zoneEl={zoneEl}
+            ensureFolder={pickSaveFolder}
+            onSaved={(name) => message.success(`已保存 ${name}`)}
+            onError={(msg) => message.error(msg)}
+            onHoverZone={onHoverZone}
+          />
+        ) : (
+          "-"
+        ),
+    },
+    {
+      title: "激活截图",
+      key: "activation_screenshot",
+      width: 120,
+      render: (_: unknown, r: JobRow) =>
+        r.activation_screenshot_path ? (
+          <DraggableShot
+            {...listShotUrls(r, "activation")}
+            filename={jobShotFilename(r.id, "activation")}
+            dir={saveDir}
+            zoneEl={zoneEl}
+            ensureFolder={pickSaveFolder}
+            onSaved={(name) => message.success(`已保存 ${name}`)}
+            onError={(msg) => message.error(msg)}
+            onHoverZone={onHoverZone}
+          />
+        ) : (
+          "-"
+        ),
+    },
+    {
+      title: "填表截图",
+      key: "form_screenshot",
+      width: 160,
+      render: (_: unknown, r: JobRow) =>
+        r.form_screenshot_path ? (
+          <DraggableShot
+            {...listShotUrls(r, "form")}
+            filename={jobShotFilename(r.id, "form")}
+            dir={saveDir}
+            zoneEl={zoneEl}
+            ensureFolder={pickSaveFolder}
+            onSaved={(name) => message.success(`已保存 ${name}`)}
+            onError={(msg) => message.error(msg)}
+            onHoverZone={onHoverZone}
+          />
+        ) : (
+          "-"
+        ),
+    },
+    {
+      title: "错误",
+      dataIndex: "last_error",
+      key: "last_error",
+      width: 280,
+      render: (v: string) =>
+        v ? (
+          <Tooltip
+            title={
+              <span style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                {v}
+              </span>
+            }
+          >
+            <div className="job-error-cell">{v}</div>
+          </Tooltip>
+        ) : (
+          "-"
+        ),
+    },
+    {
+      title: "到 s03a",
+      dataIndex: "s03a_duration",
+      key: "s03a_duration",
+      width: 100,
+      render: (v: string) => (
+        <span className="mono muted">{v || "-"}</span>
+      ),
+    },
+    {
+      title: "整个任务",
+      dataIndex: "run_duration",
+      key: "run_duration",
+      width: 100,
+      render: (v: string) => (
+        <span className="mono muted">{v || "-"}</span>
+      ),
+    },
+    {
+      title: "nnc1填表",
+      dataIndex: "nnc1_duration",
+      key: "nnc1_duration",
+      width: 110,
+      render: (v: string) => (
+        <span className="mono muted">{v || "-"}</span>
+      ),
+    },
+    {
+      title: "更新时间",
+      dataIndex: "updated_at",
+      key: "updated_at",
+      width: 160,
+      render: (v: string) => (
+        <span className="mono muted">{formatDateTime(v)}</span>
+      ),
+    },
+    {
+      title: "操作",
+      key: "action",
+      width: 280,
+      fixed: "right" as const,
+      render: (_: unknown, r: JobRow) => (
+        <Space
+          onClick={(e) => e.stopPropagation()}
+        >
+          {jobCanCancel(r.status) ? (
+            <Button
+              size="small"
+              danger
+              disabled={busyId === r.id}
+              onClick={() => act(r.id, "cancel")}
+            >
+              取消
+            </Button>
+          ) : null}
+          {jobCanRequeue(r.status) ? (
+            <Button
+              size="small"
+              type="primary"
+              disabled={busyId === r.id}
+              onClick={() => act(r.id, "requeue")}
+            >
+              重跑
+            </Button>
+          ) : null}
+          {jobCanFormRetry(r.form_status) ? (
+            <Button
+              size="small"
+              type="primary"
+              disabled={busyId === r.id}
+              onClick={() => act(r.id, "formRetry")}
+            >
+              重跑填表
+            </Button>
+          ) : null}
+          {r.status === "awaiting_review" ? (
+            <>
+              <Button
+                size="small"
+                type="primary"
+                disabled={busyId === r.id}
+                onClick={() => act(r.id, "approve")}
+              >
+                提交
+              </Button>
+              <Button
+                size="small"
+                danger
+                disabled={busyId === r.id}
+                onClick={() => act(r.id, "reject")}
+              >
+                拒绝
+              </Button>
+            </>
+          ) : null}
+          {jobCanDelete(r.status) ? (
+            <Button
+              size="small"
+              danger
+              disabled={busyId === r.id}
+              onClick={() => act(r.id, "delete")}
+            >
+              删除
+            </Button>
+          ) : null}
+          {jobCanCancel(r.status) ||
+          jobCanRequeue(r.status) ||
+          jobCanFormRetry(r.form_status) ||
+          jobCanDelete(r.status) ||
+          r.status === "awaiting_review"
+            ? null
+            : "-"}
+        </Space>
+      ),
+    },
+  ], [saveDir, zoneEl, pickSaveFolder, onHoverZone, message, busyId, act]);
+
+  return (
+    <div className="jobs-page">
+      <Card size="small" style={{ marginBottom: 16 }}>
+        <Space wrap size="middle">
+          <Input
+            placeholder="公司名"
+            value={companyInput}
+            onChange={(e) => setCompanyInput(e.target.value)}
+            onPressEnter={onSearch}
+            style={{ width: 200 }}
+            allowClear
+          />
+          <Input
+            placeholder="姓名"
+            value={directorInput}
+            onChange={(e) => setDirectorInput(e.target.value)}
+            onPressEnter={onSearch}
+            style={{ width: 160 }}
+            allowClear
+          />
+          <Input
+            placeholder="身份证号"
+            value={idInput}
+            onChange={(e) => setIdInput(e.target.value)}
+            onPressEnter={onSearch}
+            style={{ width: 200 }}
+            allowClear
+          />
+          <Select
+            value={status}
+            onChange={(v) => {
+              setPage(1);
+              setStatus(v);
+            }}
+            options={STATUS_OPTIONS}
+            style={{ width: 150 }}
+          />
+          <DatePicker.RangePicker
+            value={dateRange as [dayjs.Dayjs, dayjs.Dayjs] | null}
+            onChange={(range) => {
+              setPage(1);
+              setDateRange(range as [dayjs.Dayjs | null, dayjs.Dayjs | null] | null);
+            }}
+            style={{ width: 240 }}
+          />
+          <Button type="primary" icon={<SearchOutlined />} onClick={onSearch}>
+            搜索
+          </Button>
+          <Button onClick={onReset}>重置</Button>
+          <JobsRefreshButton
+            pollSec={POLL_SEC}
+            resetKey={`${refreshKey}|${status}|${companyName}|${directorName}|${idNumber}|${dateRange?.[0]?.format("YYYY-MM-DD") || ""}|${dateRange?.[1]?.format("YYYY-MM-DD") || ""}|${page}`}
+            onSilent={silentReload}
+            onManual={onManualRefresh}
+          />
+          {folderOk ? (
+            <>
+              <Button icon={<FolderOpenOutlined />} onClick={() => void pickSaveFolder()}>
+                {saveDir ? "更换文件夹" : "选择保存文件夹"}
+              </Button>
+              {saveDir ? (
+                <Button type="link" onClick={clearSaveFolder}>
+                  清除
+                </Button>
+              ) : null}
+            </>
+          ) : null}
+        </Space>
+      </Card>
+
+      {!folderOk ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="当前不是安全连接（公网 http 或非 Chrome）。浏览器禁止选择本地文件夹。点「保存」会下载到浏览器默认下载目录；要拖到指定文件夹请用 https 或本机 http://127.0.0.1"
+        />
+      ) : (
+        <div
+          ref={setZone}
+          className={`shot-save-zone${zoneHover ? " is-hover" : ""}`}
+        >
+          {saveDir
+            ? `把核对/成功截图拖到这里，保存到「${directoryName(saveDir)}」；也可点缩略图旁的保存`
+            : "点「保存」可选文件夹（选过一次后会记住，刷新不用再点同意）；也可先选文件夹再拖到这里"}
+        </div>
+      )}
+      <div className="jobs-table-hold" ref={tableHoldRef}>
+        <StateBox loading={loading} error={error} empty={!sorted.length}>
+          <Table
+            dataSource={sorted}
+            columns={columns}
+            rowKey="id"
+            size="small"
+            scroll={{ x: "max-content", ...(bodyY ? { y: bodyY } : {}) }}
+            pagination={{
+              current: page,
+              pageSize: PAGE_SIZE,
+              total,
+              showSizeChanger: false,
+              showTotal: (n) => `共 ${n} 条`,
+            }}
+            onChange={(pag) => {
+              setPage(pag.current || 1);
+            }}
+            expandable={{
+              expandedRowRender: (r: JobRow) => <JobExpandRow job={r} />,
+            }}
+          />
+        </StateBox>
+      </div>
+    </div>
+  );
+}

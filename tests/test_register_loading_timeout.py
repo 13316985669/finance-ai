@@ -1,0 +1,514 @@
+"""注册切步载入超时：失败写入 last_error，只自动重跑一次。"""
+
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
+from src.browser.icris_errors import (
+    IcrisFlowError,
+    IcrisLoadingTimeoutError,
+    IcrisRestartFromS01,
+    IcrisStepLoadError,
+    is_icris_format_invalid_error,
+    is_icris_username_taken_error,
+    is_id_already_registered_error,
+    register_failure_should_requeue,
+    register_loading_timeout_message,
+)
+from src.browser.icris_registration import IcrisRegistrationBot
+from src.storage.db import ExternalGroupStore
+from src.wework.icris_job_worker import IcrisJobWorker
+
+
+class TestRegisterLoadingTimeoutHelpers(unittest.TestCase):
+    def test_message_includes_step(self):
+        self.assertEqual(
+            register_loading_timeout_message("s04"),
+            "s04 页面载入中超时，遮罩仍在",
+        )
+
+    def test_timeout_requeue_once(self):
+        err = IcrisLoadingTimeoutError(register_loading_timeout_message("s04"))
+        self.assertTrue(register_failure_should_requeue(err, 1, 3))
+        self.assertFalse(register_failure_should_requeue(err, 2, 3))
+
+    def test_other_errors_keep_max_attempts(self):
+        err = IcrisStepLoadError("未进入身份证明页: https://example")
+        self.assertTrue(register_failure_should_requeue(err, 1, 3))
+        self.assertTrue(register_failure_should_requeue(err, 2, 3))
+        self.assertFalse(register_failure_should_requeue(err, 3, 3))
+        no_rq = IcrisFlowError("审核拒绝", no_requeue=True)
+        self.assertFalse(register_failure_should_requeue(no_rq, 1, 3))
+        page_err = IcrisFlowError(
+            "页面报错已整段重跑一次仍未成功: s$",
+            no_requeue=True,
+            screenshot_path="/tmp/a.png",
+        )
+        self.assertFalse(register_failure_should_requeue(page_err, 1, 3))
+        fmt = IcrisFlowError("s04 香港身分證號碼格式不正確！", no_requeue=True)
+        self.assertFalse(register_failure_should_requeue(fmt, 1, 3))
+        taken = IcrisFlowError("s02 用户名称已存在")
+        self.assertTrue(register_failure_should_requeue(taken, 1, 3))
+        self.assertTrue(register_failure_should_requeue(taken, 2, 3))
+        self.assertFalse(register_failure_should_requeue(taken, 3, 3))
+
+    def test_format_invalid_detect(self):
+        self.assertTrue(
+            is_icris_format_invalid_error(["香港身分證號碼格式不正確！"])
+        )
+        self.assertTrue(is_icris_format_invalid_error("身份证号码格式不正确"))
+        self.assertFalse(
+            is_icris_format_invalid_error(
+                ["相同的身分證件號碼已在系統中登記！"]
+            )
+        )
+        self.assertFalse(is_icris_format_invalid_error(["請輸入身分證號碼"]))
+        self.assertFalse(
+            is_id_already_registered_error(["香港身分證號碼格式不正確！"])
+        )
+
+    def test_username_taken_detect(self):
+        self.assertTrue(is_icris_username_taken_error(["用户名称已存在"]))
+        self.assertTrue(is_icris_username_taken_error("用戶名稱已被使用"))
+        self.assertFalse(is_icris_username_taken_error(["香港身分證號碼格式不正確！"]))
+
+    def test_nav_step_label(self):
+        bot = IcrisRegistrationBot(llm=MagicMock())
+        self.assertEqual(bot._nav_step_label("s04"), "s04")
+        self.assertEqual(
+            bot._nav_step_label(
+                None,
+                "https://www.e-services.cr.gov.hk/ICRIS3EF/system/registration/s03.do",
+            ),
+            "s04",
+        )
+        self.assertEqual(
+            bot._nav_step_label(
+                None,
+                "https://www.e-services.cr.gov.hk/ICRIS3EF/system/registration/s04.do",
+            ),
+            "s03a",
+        )
+
+
+class TestRegisterStepReadyAndMissing(unittest.IsolatedAsyncioTestCase):
+    async def test_wait_step_ready_false_while_overlay(self):
+        bot = IcrisRegistrationBot(llm=MagicMock())
+        page = MagicMock()
+        page.is_closed = MagicMock(return_value=False)
+        page.wait_for_timeout = AsyncMock()
+        bot._wait_spin_clear = AsyncMock(return_value=False)
+        bot._is_spinning = AsyncMock(return_value=True)
+        ready = AsyncMock(return_value=True)
+        ok = await bot._wait_step_ready(
+            page, ready, timeout_ms=200, label="s04身份证明"
+        )
+        self.assertFalse(ok)
+        ready.assert_not_called()
+
+    async def test_missing_step_overlay_is_loading_timeout(self):
+        bot = IcrisRegistrationBot(llm=MagicMock())
+        page = MagicMock()
+        page.url = "https://example/s03.do"
+        bot._is_spinning = AsyncMock(return_value=True)
+        with self.assertRaises(IcrisLoadingTimeoutError) as ctx:
+            await bot._raise_if_missing_registration_step(
+                page, step="s04", label="身份证明页"
+            )
+        self.assertIn("s04", str(ctx.exception))
+        self.assertIn("载入中超时", str(ctx.exception))
+
+    async def test_missing_step_without_overlay_is_step_load(self):
+        bot = IcrisRegistrationBot(llm=MagicMock())
+        page = MagicMock()
+        page.url = "https://example/s03.do"
+        bot._is_spinning = AsyncMock(return_value=False)
+        with self.assertRaises(IcrisStepLoadError) as ctx:
+            await bot._raise_if_missing_registration_step(
+                page, step="s04", label="身份证明页"
+            )
+        self.assertIn("未进入身份证明页", str(ctx.exception))
+
+    async def test_wait_after_continue_raises_when_overlay_stuck(self):
+        bot = IcrisRegistrationBot(llm=MagicMock())
+        page = MagicMock()
+        page.url = "https://example/s03.do"
+        page.reload = AsyncMock()
+        bot._wait_step_ready = AsyncMock(return_value=False)
+        bot._get_validation_errors = AsyncMock(return_value=[])
+        bot._wait_spin_clear = AsyncMock(return_value=False)
+        with self.assertRaises(IcrisLoadingTimeoutError) as ctx:
+            await bot._wait_after_continue(
+                page, page.url, expect_step="s04"
+            )
+        self.assertIn("s04", str(ctx.exception))
+        page.reload.assert_not_called()
+
+    async def test_wait_after_continue_format_raises(self):
+        bot = IcrisRegistrationBot(llm=MagicMock())
+        page = MagicMock()
+        page.url = "https://example/s04.do"
+        bot._wait_step_ready = AsyncMock(return_value=False)
+        bot._get_validation_errors = AsyncMock(
+            return_value=["香港身分證號碼格式不正確！"]
+        )
+        bot._page_body_text = AsyncMock(return_value="")
+        with self.assertRaises(IcrisFlowError) as ctx:
+            await bot._wait_after_continue(
+                page, page.url, expect_step="s04"
+            )
+        self.assertTrue(ctx.exception.no_requeue)
+        self.assertFalse(ctx.exception.id_already_registered)
+        self.assertIn("格式不", str(ctx.exception).replace(" ", ""))
+
+    async def test_wait_after_continue_required_restarts(self):
+        bot = IcrisRegistrationBot(llm=MagicMock())
+        page = MagicMock()
+        page.url = "https://example/s03.do"
+        page.reload = AsyncMock()
+        bot._wait_step_ready = AsyncMock(return_value=False)
+        bot._get_validation_errors = AsyncMock(
+            return_value=["請輸入身分證號碼"]
+        )
+        bot._page_body_text = AsyncMock(return_value="")
+        bot._save_error_screenshot = AsyncMock(return_value="x.png")
+        with self.assertRaises(IcrisRestartFromS01) as ctx:
+            await bot._wait_after_continue(
+                page, page.url, expect_step="s04"
+            )
+        self.assertIn("請輸入身分證號碼", str(ctx.exception))
+        page.reload.assert_not_called()
+        bot._save_error_screenshot.assert_awaited()
+
+    async def test_id_registered_raised_before_format(self):
+        bot = IcrisRegistrationBot(llm=MagicMock())
+        page = MagicMock()
+        errs = [
+            "相同的身分證件號碼已在系統中登記！",
+            "香港身分證號碼格式不正確！",
+        ]
+        with self.assertRaises(IcrisFlowError) as ctx:
+            await bot._raise_if_id_already_registered(page, errs)
+            await bot._raise_if_format_invalid(page, errs, step="s04")
+        self.assertTrue(ctx.exception.id_already_registered)
+        self.assertTrue(ctx.exception.no_requeue)
+
+    async def test_retry_s02_username_taken_raises_requeueable(self):
+        bot = IcrisRegistrationBot(llm=MagicMock())
+        page = MagicMock()
+        data: dict = {"applicant": {"name_en": "Zhang San"}}
+        bot._get_validation_errors = AsyncMock(
+            return_value=["用户名称已存在"]
+        )
+        bot._regen_s02_username = MagicMock(return_value=("newu", "p@"))
+        bot._fill_s02_credentials_fields = AsyncMock(return_value=3)
+        bot._persist_s02_account_to_job = MagicMock()
+        bot._click_account_profile_continue = AsyncMock(return_value=False)
+        with self.assertRaises(IcrisFlowError) as ctx:
+            await bot._retry_s02_if_username_taken(page, data)
+        self.assertFalse(ctx.exception.no_requeue)
+        self.assertIn("s02", str(ctx.exception))
+
+
+class TestS04IdentityTypeSelect(unittest.IsolatedAsyncioTestCase):
+    def _page(self) -> MagicMock:
+        page = MagicMock()
+        page.is_closed = MagicMock(return_value=False)
+        page.url = "https://example/s04.do"
+        page.wait_for_timeout = AsyncMock()
+        page.evaluate = AsyncMock(return_value=0)
+        loc = MagicMock()
+        loc.filter.return_value = loc
+        loc.count = AsyncMock(return_value=0)
+        loc.nth.return_value = loc
+        page.locator = MagicMock(return_value=loc)
+        return page
+
+    async def test_fill_identity_raises_when_overlay_stuck(self):
+        bot = IcrisRegistrationBot(llm=MagicMock())
+        page = self._page()
+        bot._identity_proof_filled = False
+        bot._is_identity_proof_step = AsyncMock(return_value=True)
+        bot._wait_spin_clear = AsyncMock(return_value=False)
+        with self.assertRaises(IcrisLoadingTimeoutError) as ctx:
+            await bot._fill_identity_proof_step(page, {})
+        self.assertIn("s04", str(ctx.exception))
+        self.assertIn("载入中超时", str(ctx.exception))
+
+    async def test_wait_radios_overlay_is_loading_timeout(self):
+        bot = IcrisRegistrationBot(llm=MagicMock())
+        page = self._page()
+        bot._raise_if_cancelled = MagicMock()
+        bot._is_spinning = AsyncMock(return_value=True)
+        bot._wait_spin_clear = AsyncMock(return_value=False)
+        with self.assertRaises(IcrisLoadingTimeoutError) as ctx:
+            await bot._wait_s04_id_type_radios(page, timeout_ms=200)
+        self.assertIn("s04", str(ctx.exception))
+
+    async def test_select_id_type_skips_section_scan_when_no_radio(self):
+        bot = IcrisRegistrationBot(llm=MagicMock())
+        page = self._page()
+        bot._wait_s04_id_type_radios = AsyncMock(return_value=False)
+        bot._select_radio_in_section = AsyncMock(return_value=True)
+        bot._click_radio_by_text = AsyncMock(return_value=True)
+        ok = await bot._select_identity_id_type_radio(
+            page, "PRC_ID", r"中华人民共和国身分证号码", timeout_ms=200
+        )
+        self.assertFalse(ok)
+        bot._select_radio_in_section.assert_not_called()
+        bot._click_radio_by_text.assert_not_called()
+        page.evaluate.assert_not_called()
+
+    async def test_click_radio_does_not_use_star_section(self):
+        bot = IcrisRegistrationBot(llm=MagicMock())
+        page = self._page()
+        bot._verify_option_selected = AsyncMock(return_value=False)
+        bot._select_radio_in_section = AsyncMock(return_value=True)
+        ok = await bot._click_radio_by_text(page, r"网上提交|網上提交")
+        self.assertTrue(ok)
+        bot._select_radio_in_section.assert_awaited_once()
+        section = bot._select_radio_in_section.await_args.args[1]
+        self.assertNotEqual(section, r".*")
+        self.assertNotEqual(section.strip(), ".*")
+        self.assertIn("身分證明", section)
+        self.assertIn("证明文件", section)
+
+    async def test_fill_identity_stops_when_type_not_selected(self):
+        bot = IcrisRegistrationBot(llm=MagicMock())
+        page = self._page()
+        bot._identity_proof_filled = False
+        bot._is_identity_proof_step = AsyncMock(return_value=True)
+        bot._wait_spin_clear = AsyncMock(return_value=True)
+        bot._derive_identity_proof = MagicMock(
+            return_value={
+                "id_type": "PRC_ID",
+                "id_type_pat": "中华人民共和国身分证号码",
+                "id_number": "44051420000318492X",
+                "issuing_country": "",
+                "submission_method": "online",
+                "submission_pat": "网上提交",
+                "online_pat": "经核证",
+                "online_method": "certified_copy",
+                "document_files": [],
+            }
+        )
+        bot._select_identity_id_type_radio = AsyncMock(return_value=False)
+        bot._fill_s04_single_number = AsyncMock(return_value=True)
+        bot._click_radio_by_text = AsyncMock(return_value=True)
+        filled = await bot._fill_identity_proof_step(page, {})
+        self.assertEqual(filled, 0)
+        bot._fill_s04_single_number.assert_not_called()
+        bot._click_radio_by_text.assert_not_called()
+
+
+class TestRegenS02Username(unittest.TestCase):
+    def test_clears_session_and_rolls_suffix(self):
+        bot = IcrisRegistrationBot(llm=MagicMock())
+        data = {
+            "applicant": {"name_en": "Zhang San", "id_number": "F570235(8)"},
+            "_icris_session": {"username": "olduser", "password": "oldpass"},
+        }
+        user, _pwd = bot._regen_s02_username(data)
+        self.assertNotEqual(user, "olduser")
+        self.assertEqual(data["_icris_session"]["username"], user)
+        self.assertNotEqual(data["icris_account"]["username"], "olduser")
+
+
+class TestRegisterLoadingTimeoutWorker(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = ExternalGroupStore(
+            db_path=Path(self._tmp.name) / "reg_loading.db"
+        )
+        self.worker = IcrisJobWorker(store=self.store, workflow=MagicMock())
+        self.worker.workflow.notify_job_result = MagicMock()
+        self.worker._backoff_iso = lambda attempts: ""
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _claimed(self, room: str) -> tuple[int, dict]:
+        job, created = self.store.enqueue_registration_job(room, source="test")
+        self.assertTrue(created)
+        claimed = self.store.claim_next_job()
+        self.assertIsNotNone(claimed)
+        return int(job["id"]), claimed
+
+    def test_timeout_requeues_once_then_failed(self):
+        self.worker.workflow.run_icris_job = MagicMock(
+            side_effect=IcrisLoadingTimeoutError(
+                register_loading_timeout_message("s04")
+            )
+        )
+        job_id, claimed = self._claimed("room-to")
+        self.assertEqual(int(claimed["attempts"]), 1)
+        self.worker._process_job(claimed)
+        row = self.store.get_registration_job(job_id)
+        self.assertEqual(row["status"], "pending")
+        self.assertIn("s04", row["last_error"])
+        self.assertIn("载入中超时", row["last_error"])
+        self.assertNotEqual(str(row.get("activation_status") or ""), "pending")
+
+        claimed2 = self.store.claim_next_job()
+        self.assertIsNotNone(claimed2)
+        self.assertEqual(int(claimed2["id"]), job_id)
+        self.assertEqual(int(claimed2["attempts"]), 2)
+        self.worker._process_job(claimed2)
+        row2 = self.store.get_registration_job(job_id)
+        self.assertEqual(row2["status"], "failed")
+        self.assertIn("载入中超时", row2["last_error"])
+        self.worker.workflow.notify_job_result.assert_called()
+
+    def test_step_load_still_requeues_under_max_attempts(self):
+        self.worker.workflow.run_icris_job = MagicMock(
+            side_effect=IcrisStepLoadError("未进入身份证明页: https://example")
+        )
+        job_id, claimed = self._claimed("room-step")
+        self.worker._process_job(claimed)
+        row = self.store.get_registration_job(job_id)
+        self.assertEqual(row["status"], "pending")
+        self.assertIn("未进入身份证明页", row["last_error"])
+
+        claimed2 = self.store.claim_next_job()
+        self.worker._process_job(claimed2)
+        row2 = self.store.get_registration_job(job_id)
+        self.assertEqual(row2["status"], "pending")
+        self.assertEqual(int(row2["attempts"]), 2)
+
+    def test_success_still_activation_pending(self):
+        ctx = MagicMock()
+        ctx.package_dir = ""
+        ctx.messages = []
+        ctx.esubmit_screenshot_path = ""
+        ctx.success_screenshot_path = ""
+        self.worker.workflow.run_icris_job = MagicMock(return_value=ctx)
+        job_id, claimed = self._claimed("room-ok")
+        self.worker._process_job(claimed)
+        row = self.store.get_registration_job(job_id)
+        self.assertEqual(row["status"], "succeeded")
+        self.assertEqual(row["activation_status"], "pending")
+        self.assertEqual(row["last_error"], "")
+
+    def test_format_invalid_failed_keeps_success_shot_empty(self):
+        shot = str(Path(self._tmp.name) / "fail.png")
+        self.worker.workflow.run_icris_job = MagicMock(
+            side_effect=IcrisFlowError(
+                "s04 香港身分證號碼格式不正確！",
+                no_requeue=True,
+                screenshot_path=shot,
+            )
+        )
+        job_id, claimed = self._claimed("room-fmt")
+        self.worker._process_job(claimed)
+        row = self.store.get_registration_job(job_id)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["screenshot_path"], shot)
+        # 失败截图不得写入成功截图列
+        self.assertEqual(row["success_screenshot_path"], "")
+        self.assertIn("格式不", str(row["last_error"]).replace(" ", ""))
+        self.assertEqual(int(row.get("id_already_registered") or 0), 0)
+        self.assertNotEqual(str(row.get("activation_status") or ""), "pending")
+        self.worker.workflow.notify_job_result.assert_called()
+
+    def test_real_success_shot_survives_failure(self):
+        """异常携带真实 s05 成功图（icris_success/）时落库保留。"""
+        fail_shot = str(Path(self._tmp.name) / "fail.png")
+        ok_shot = str(
+            Path(self._tmp.name) / "icris_success" / "job_success_x.png"
+        )
+        err = IcrisFlowError(
+            "s05 截图后页面异常", no_requeue=True, screenshot_path=fail_shot
+        )
+        err.success_screenshot_path = ok_shot
+        self.worker.workflow.run_icris_job = MagicMock(side_effect=err)
+        job_id, claimed = self._claimed("room-okshot")
+        self.worker._process_job(claimed)
+        row = self.store.get_registration_job(job_id)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["screenshot_path"], fail_shot)
+        self.assertEqual(row["success_screenshot_path"], ok_shot)
+
+    def test_non_success_dir_shot_dropped_from_success_column(self):
+        """异常携带的成功图不在 icris_success/ 下时不予采纳。"""
+        fail_shot = str(Path(self._tmp.name) / "fail.png")
+        err = IcrisFlowError("boom", no_requeue=True, screenshot_path=fail_shot)
+        err.success_screenshot_path = fail_shot
+        self.worker.workflow.run_icris_job = MagicMock(side_effect=err)
+        job_id, claimed = self._claimed("room-badshot")
+        self.worker._process_job(claimed)
+        row = self.store.get_registration_job(job_id)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["success_screenshot_path"], "")
+
+    def test_id_already_registered_still_flagged(self):
+        shot = str(Path(self._tmp.name) / "dup.png")
+        self.worker.workflow.run_icris_job = MagicMock(
+            side_effect=IcrisFlowError(
+                "相同的身分證件號碼已在系統中登記！",
+                no_requeue=True,
+                id_already_registered=True,
+                screenshot_path=shot,
+            )
+        )
+        job_id, claimed = self._claimed("room-idreg")
+        self.worker._process_job(claimed)
+        row = self.store.get_registration_job(job_id)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(int(row["id_already_registered"]), 1)
+        # 失败截图不得写入成功截图列
+        self.assertEqual(row["success_screenshot_path"], "")
+        self.assertEqual(row["screenshot_path"], shot)
+
+    def test_generic_error_failed_on_third_attempt(self):
+        self.worker.workflow.run_icris_job = MagicMock(
+            side_effect=IcrisStepLoadError("未进入身份证明页: https://example")
+        )
+        job_id, claimed = self._claimed("room-cap3")
+        self.worker._process_job(claimed)
+        self.assertEqual(
+            self.store.get_registration_job(job_id)["status"], "pending"
+        )
+        claimed2 = self.store.claim_next_job()
+        self.worker._process_job(claimed2)
+        self.assertEqual(
+            self.store.get_registration_job(job_id)["status"], "pending"
+        )
+        claimed3 = self.store.claim_next_job()
+        self.assertIsNotNone(claimed3)
+        self.assertEqual(int(claimed3["attempts"]), 3)
+        self.worker._process_job(claimed3)
+        row = self.store.get_registration_job(job_id)
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("未进入身份证明页", row["last_error"])
+
+    def test_failed_shot_does_not_fill_success_column(self):
+        job_id, claimed = self._claimed("room-shotcol")
+        self.store.mark_job_failed(
+            job_id,
+            error="s04 香港身分證號碼格式不正確！",
+            screenshot_path="D:/fail.png",
+        )
+        row = self.store.get_registration_job(job_id)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["screenshot_path"], "D:/fail.png")
+        # 不再用失败图兜底成功截图列
+        self.assertEqual(row["success_screenshot_path"], "")
+        self.assertIn("格式不", str(row["last_error"]).replace(" ", ""))
+
+    def test_failed_with_explicit_success_shot_keeps_it(self):
+        job_id, claimed = self._claimed("room-shotcol2")
+        self.store.mark_job_failed(
+            job_id,
+            error="boom",
+            screenshot_path="D:/fail.png",
+            success_screenshot_path="D:/icris_success/job_success_1.png",
+        )
+        row = self.store.get_registration_job(job_id)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["screenshot_path"], "D:/fail.png")
+        self.assertEqual(
+            row["success_screenshot_path"], "D:/icris_success/job_success_1.png"
+        )

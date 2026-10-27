@@ -1,0 +1,1374 @@
+"""管理后台 JSON API（/admin/api/*）。"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
+
+from config.settings import settings
+from src.storage.db import ExternalGroupStore
+
+logger = logging.getLogger(__name__)
+
+
+def _ok(**payload: Any) -> tuple[dict[str, Any], int]:
+    return {"ok": True, **payload}, 200
+
+
+def _err(message: str, code: int = 400) -> tuple[dict[str, Any], int]:
+    return {"ok": False, "error": message}, code
+
+
+def _session_label(row: dict[str, Any]) -> str:
+    name = row.get("name") or ""
+    kfid = row.get("open_kfid") or ""
+    if kfid:
+        acc = settings.get_kf_account(str(kfid))
+        if acc and acc.label:
+            return f"{name} ({acc.label})" if name else acc.label
+    return str(name)
+
+
+def handle_admin_api(
+    *,
+    method: str,
+    path: str,
+    store: ExternalGroupStore,
+    icris_worker: Any = None,
+    body: dict | None = None,
+) -> tuple[dict[str, Any], int] | None:
+    """处理 /admin/api/*。非 API 路径返回 None。"""
+    parsed = urlparse(path or "")
+    raw = (parsed.path or "").rstrip("/") or "/"
+    if not raw.startswith("/admin/api"):
+        return None
+
+    rel = raw[len("/admin/api") :].lstrip("/")  # e.g. overview, sessions/xxx
+    method = (method or "GET").upper()
+    query = parse_qs(parsed.query)
+
+    try:
+        if method == "GET" and rel == "overview":
+            try:
+                hours = float(query.get("hours", ["24"])[0])
+            except (TypeError, ValueError):
+                hours = 24.0
+            return _handle_overview(store, hours=hours)
+        if method == "GET" and rel == "sessions":
+            channel = (query.get("channel", ["all"])[0] or "all").strip().lower()
+            return _handle_sessions_list(store, channel)
+        if method == "GET" and rel.startswith("sessions/"):
+            roomid = unquote(rel[len("sessions/") :])
+            return _handle_session_detail(store, roomid)
+        if method == "GET" and rel == "jobs":
+            status = (query.get("status", [""])[0] or "").strip().lower()
+            keyword = (query.get("keyword", [""])[0] or "").strip()
+            date_from = (query.get("date_from", [""])[0] or "").strip()
+            date_to = (query.get("date_to", [""])[0] or "").strip()
+            company_name = (query.get("company_name", [""])[0] or "").strip()
+            director_name = (query.get("director_name", [""])[0] or "").strip()
+            id_number = (query.get("id_number", [""])[0] or "").strip()
+            try:
+                limit = int(query.get("limit", ["50"])[0])
+            except ValueError:
+                limit = 50
+            try:
+                offset = int(query.get("offset", ["0"])[0])
+            except ValueError:
+                offset = 0
+            return _handle_jobs_list(
+                store,
+                status=status,
+                limit=limit,
+                offset=offset,
+                keyword=keyword,
+                date_from=date_from,
+                date_to=date_to,
+                company_name=company_name,
+                director_name=director_name,
+                id_number=id_number,
+            )
+        if method == "GET" and rel.startswith("jobs/"):
+            mid = rel[len("jobs/") :]
+            if "/" not in mid and mid.isdigit():
+                return _handle_job_detail(store, int(mid))
+            return _err("invalid job id", 400)
+        if method == "POST" and rel.startswith("jobs/") and rel.endswith("/cancel"):
+            job_id = _parse_job_id(rel, suffix="/cancel")
+            if job_id is None:
+                return _err("invalid job id", 400)
+            return _handle_job_cancel(store, job_id)
+        if method == "POST" and rel.startswith("jobs/") and rel.endswith("/requeue"):
+            job_id = _parse_job_id(rel, suffix="/requeue")
+            if job_id is None:
+                return _err("invalid job id", 400)
+            return _handle_job_requeue(store, job_id)
+        if method == "POST" and rel.startswith("jobs/") and rel.endswith("/approve"):
+            job_id = _parse_job_id(rel, suffix="/approve")
+            if job_id is None:
+                return _err("invalid job id", 400)
+            return _handle_job_approve(store, job_id)
+        if method == "POST" and rel.startswith("jobs/") and rel.endswith("/reject"):
+            job_id = _parse_job_id(rel, suffix="/reject")
+            if job_id is None:
+                return _err("invalid job id", 400)
+            return _handle_job_reject(store, job_id)
+        # 填表重跑
+        if method == "POST" and rel.startswith("jobs/") and rel.endswith("/form-retry"):
+            job_id = _parse_job_id(rel, suffix="/form-retry")
+            if job_id is None:
+                return _err("invalid job id", 400)
+            return _handle_job_form_retry(store, job_id)
+        if method == "DELETE" and rel.startswith("jobs/"):
+            mid = rel[len("jobs/") :]
+            if "/" not in mid and mid.isdigit():
+                return _handle_job_delete(store, int(mid))
+            return _err("invalid job id", 400)
+        # 邮箱账号配置
+        if method == "GET" and rel == "email-accounts":
+            return _ok(items=store.list_email_accounts())
+        if method == "POST" and rel == "email-accounts":
+            return _handle_email_account_upsert(store, body or {})
+        if method == "POST" and rel.startswith("email-accounts/") and rel.endswith("/test"):
+            aid = _parse_account_id(rel, suffix="/test")
+            if aid is None:
+                return _err("invalid account id", 400)
+            return _handle_email_account_test(store, aid)
+        if method == "DELETE" and rel.startswith("email-accounts/"):
+            aid = _parse_account_id(rel, suffix="")
+            if aid is None:
+                return _err("invalid account id", 400)
+            return _handle_email_account_delete(store, aid)
+        if method == "POST" and rel == "icris-activate-probe":
+            return _handle_icris_activate_probe(store, body or {})
+        # 注册办事处默认地址
+        if method == "GET" and rel == "default-office":
+            return _handle_default_office_get(store)
+        if method == "PUT" and rel == "default-office":
+            return _handle_default_office_put(store, body or {})
+        if method == "GET" and rel == "quality":
+            try:
+                hours = float(query.get("hours", ["24"])[0])
+            except ValueError:
+                hours = 24.0
+            return _handle_quality(store, hours=hours)
+        if method == "GET" and rel == "register-runner/defaults":
+            from src.web.admin_runner import defaults as runner_defaults
+
+            return _ok(**runner_defaults())
+        if method == "GET" and rel == "s03-countries":
+            from src.materials.countries import load_s03_country_options
+
+            items = [
+                {"label": row["label"], "value": row["label"]}
+                for row in load_s03_country_options()
+                if row.get("label")
+            ]
+            return _ok(items=items, count=len(items))
+        if method == "GET" and rel == "s03-districts":
+            from src.materials.address_classify import load_s03_district_options
+
+            items = [
+                {"label": row["label"], "value": row["label"]}
+                for row in load_s03_district_options()
+                if row.get("label")
+            ]
+            return _ok(items=items, count=len(items))
+        if method == "GET" and rel == "register-runner/status":
+            from src.web.admin_runner import status as runner_status
+
+            return _ok(**runner_status())
+        if method == "POST" and rel == "register-runner/submit":
+            return _handle_runner_submit(body)
+        if method == "POST" and rel == "register-runner/extract-id":
+            return _handle_runner_extract_id(body)
+        if method == "POST" and rel == "register-runner/classify-id":
+            return _handle_runner_classify_id(body)
+        if method == "POST" and rel == "register-runner/parse-paste":
+            return _handle_runner_parse_paste(body)
+        if method == "POST" and rel == "id-extract":
+            return _handle_id_extract(body)
+        if method == "POST" and rel == "id-extract/translate":
+            return _handle_id_translate(body)
+        if method == "GET" and rel == "wework/send-modes":
+            return _handle_wework_send_modes()
+        if method == "POST" and rel == "wework/send":
+            return _handle_wework_send(body)
+    except Exception as e:
+        logger.exception("admin api error: %s", e)
+        return _err(str(e) or "internal error", 500)
+
+    return _err("not found", 404)
+
+
+def _handle_wework_send_modes() -> tuple[dict[str, Any], int]:
+    """返回当前外部群发送模式（决策结果）。"""
+    return _ok(
+        configured=settings.wework_configured,
+        kf_configured=settings.wework_kf_configured,
+        send_mode=settings.wework_external_send_mode_resolved,
+        channel=settings.wework_channel_resolved,
+        webhook_url_set=bool(
+            (settings.wework_external_group_webhook_url or "").strip()
+        ),
+        default_owner_set=bool(
+            (settings.wework_default_group_owner_userid or "").strip()
+        ),
+    )
+
+
+def _handle_wework_send(body: dict | None) -> tuple[dict[str, Any], int]:
+    """手动往外部群发消息（测试用）。
+
+    body: {chat_id, content, to_external_userid?}
+    """
+    if not isinstance(body, dict):
+        return _err("request body required", 400)
+    chat_id = str(body.get("chat_id") or "").strip()
+    content = str(body.get("content") or "").strip()
+    to_external_userid = str(body.get("to_external_userid") or "").strip() or None
+    if not chat_id:
+        return _err("chat_id required", 400)
+    if not content:
+        return _err("content required", 400)
+    if len(content.encode("utf-8")) > 2000:
+        return _err("content too long (>2000 bytes)", 400)
+
+    from src.wework.external_client import WeWorkExternalClient
+
+    client = WeWorkExternalClient()
+    if client._mock_mode:
+        return _err(
+            "当前为 mock 模式（未配置 WEWORK_CORP_ID/SECRET），无法真实发送；"
+            "请配置 .env 后重启 admin",
+            400,
+        )
+    try:
+        # 用 describe_send_plan 先告知将走哪条通道
+        plan = client.describe_send_plan(chat_id, to_external_userid=to_external_userid)
+        result = client.send_group_text(
+            chat_id,
+            content,
+            to_external_userid=to_external_userid,
+        )
+        errcode = int(result.get("errcode", 0) or 0)
+        if errcode != 0:
+            return _err(
+                f"发送失败 errcode={errcode}: {result.get('errmsg', '')}",
+                500,
+            )
+        return _ok(plan=plan, result=result)
+    except Exception as e:
+        logger.exception("wework send failed chat_id=%s", chat_id)
+        return _err(str(e) or "send failed", 500)
+
+
+def _handle_runner_submit(body: dict | None) -> tuple[dict[str, Any], int]:
+    """快速注册：表单字段 + 证件文件(data_url) → 入队 registration_jobs。"""
+    from src.web.admin_runner import submit as runner_submit
+
+    if not isinstance(body, dict):
+        return _err("request body required", 400)
+    fields = body.get("fields") or {}
+    files = body.get("files") or {}
+    if not isinstance(fields, dict) or not isinstance(files, dict):
+        return _err("fields/files must be objects", 400)
+    # 缺省允许提交（s03a 审核后再点 ICRIS 最终提交）；显式 true 才仅填表
+    raw_dry = body.get("dry_run", False)
+    if isinstance(raw_dry, str):
+        dry_run = raw_dry.strip().lower() not in ("0", "false", "no", "off")
+    else:
+        dry_run = bool(raw_dry)
+    return runner_submit(fields, files, dry_run=dry_run)
+
+
+def _handle_runner_classify_id(body: dict | None) -> tuple[dict[str, Any], int]:
+    """粘贴资料 LLM 判定证件类型（HKID / PRC_ID / PASSPORT）。"""
+    from src.web.admin_runner import classify_id_text
+
+    if not isinstance(body, dict):
+        return _err("request body required", 400)
+    text = str(body.get("text") or body.get("paste_text") or "")
+    id_number = str(body.get("id_number") or "")
+    return classify_id_text(text=text, id_number=id_number)
+
+
+def _handle_runner_parse_paste(body: dict | None) -> tuple[dict[str, Any], int]:
+    """粘贴全文 LLM 解析（简繁标签、住址按正文分中英）。"""
+    from src.web.admin_runner import parse_paste_text
+
+    if not isinstance(body, dict):
+        return _err("request body required", 400)
+    text = str(body.get("text") or body.get("paste_text") or "")
+    return parse_paste_text(text=text)
+
+
+def _handle_runner_extract_id(body: dict | None) -> tuple[dict[str, Any], int]:
+    """证件图片识别：回填姓名/号码/住址等（不覆盖已填）。"""
+    from src.web.admin_runner import extract_id_fields
+
+    if not isinstance(body, dict):
+        return _err("request body required", 400)
+    data_url = str(body.get("data_url") or "").strip()
+    if not data_url:
+        file_obj = body.get("file") or {}
+        if isinstance(file_obj, dict):
+            data_url = str(file_obj.get("data_url") or "").strip()
+            filename = str(file_obj.get("name") or body.get("filename") or "")
+        else:
+            filename = str(body.get("filename") or "")
+    else:
+        filename = str(body.get("filename") or "")
+    if not data_url:
+        return _err("data_url required", 400)
+    current = body.get("current_fields") or body.get("fields") or {}
+    if not isinstance(current, dict):
+        current = {}
+    fill_empty = body.get("fill_empty_only", True)
+    if isinstance(fill_empty, str):
+        fill_empty_only = fill_empty.strip().lower() not in ("0", "false", "no", "off")
+    else:
+        fill_empty_only = bool(fill_empty)
+    expected = str(body.get("expected_id_type") or "").strip().upper()
+    if expected and expected not in ("PRC_ID", "HKID", "PASSPORT", "TW_ID", "SCREENSHOT"):
+        expected = ""
+    return extract_id_fields(
+        data_url=data_url,
+        filename=filename,
+        fill_empty_only=fill_empty_only,
+        current_fields={str(k): str(v or "") for k, v in current.items()},
+        expected_id_type=expected,
+    )
+
+
+def _handle_id_extract(body: dict | None) -> tuple[dict[str, Any], int]:
+    """独立证件识别模块：选择类型后上传图片识别。"""
+    import base64
+    import re
+
+    from src.materials.id_extract import run_id_extract
+
+    if not isinstance(body, dict):
+        return _err("request body required", 400)
+
+    expected = str(body.get("expected_id_type") or body.get("id_type") or "").strip().upper()
+    data_url = str(body.get("data_url") or "").strip()
+    filename = str(body.get("filename") or "")
+    if not data_url:
+        file_obj = body.get("file") or {}
+        if isinstance(file_obj, dict):
+            data_url = str(file_obj.get("data_url") or "").strip()
+            filename = str(file_obj.get("name") or filename or "")
+    if not data_url:
+        return _err("data_url required", 400)
+    # expected 可选：空则由视觉模型自动判别证件类型
+    if expected and expected not in ("PRC_ID", "HKID", "PASSPORT", "TW_ID"):
+        return _err("expected_id_type 须为 PRC_ID / HKID / PASSPORT / TW_ID", 400)
+
+    m = re.match(r"^data:([\w/+.-]+);base64,(.*)$", data_url, re.DOTALL)
+    if not m:
+        return _err("invalid data_url", 400)
+    try:
+        raw = base64.b64decode(m.group(2))
+    except Exception:
+        return _err("invalid base64 payload", 400)
+
+    mime = (m.group(1) or "").lower()
+    is_pdf = mime == "application/pdf" or filename.lower().endswith(".pdf")
+    if is_pdf:
+        from src.materials.id_extract import run_id_extract_pdf
+
+        result = run_id_extract_pdf(
+            pdf_bytes=raw,
+            filename=filename or "id.pdf",
+            expected_id_type=expected,
+        )
+    else:
+        result = run_id_extract(
+            image_bytes=raw,
+            filename=filename or "id.jpg",
+            expected_id_type=expected,
+        )
+    if not result.get("ok"):
+        err = str(result.get("error") or "")
+        return result, 422 if ("未能识别" in err or "PDF" in err) else 400
+    return result, 200
+
+
+def _handle_id_translate(body: dict | None) -> tuple[dict[str, Any], int]:
+    """证件识别模块的翻译引擎切换：用 Google / 有道 API 译中文地址为英文，覆盖 LLM 译文。"""
+    if not isinstance(body, dict):
+        return _err("request body required", 400)
+    from src.materials.translate_engines import (
+        SUPPORTED_ENGINES,
+        available_engines,
+        translate_with,
+    )
+
+    text = str(body.get("text") or body.get("q") or "").strip()
+    engine = str(body.get("engine") or "").strip().lower()
+    if not text:
+        return _err("text required", 400)
+    if engine not in SUPPORTED_ENGINES:
+        return _err(f"engine 仅支持 {' / '.join(SUPPORTED_ENGINES)}", 400)
+    avail = available_engines()
+    if engine not in avail:
+        configured = "、".join(avail) or "（无）"
+        if engine == "google":
+            hint = "请在 .env 配置 GOOGLE_TRANSLATE_API_KEY"
+        elif engine == "youdao":
+            hint = "请在 .env 配置 YOUDAO_APP_KEY / YOUDAO_APP_SECRET"
+        else:
+            hint = "请在 .env 配置 DEEPL_AUTH_KEY（Free 版以 :fx 结尾）"
+        return _err(f"该翻译引擎未配置密钥（已配置: {configured}）。{hint}", 400)
+    try:
+        translated = translate_with(engine, text)
+    except ValueError as e:
+        return _err(f"{engine} 翻译失败: {e}", 502)
+    except Exception as e:
+        logger.warning("translate engine=%s failed: %s", engine, e)
+        return _err(f"{engine} 翻译失败: {e}", 502)
+    if not translated:
+        return _err(f"{engine} 翻译返回为空", 502)
+    return _ok(translated=translated, engine=engine)
+
+
+def _parse_job_id(rel: str, *, suffix: str) -> int | None:
+    mid = rel[len("jobs/") : -len(suffix)]
+    try:
+        return int(mid)
+    except ValueError:
+        return None
+
+
+def _parse_account_id(rel: str, *, suffix: str) -> int | None:
+    mid = rel[len("email-accounts/") : -len(suffix)] if suffix else rel[len("email-accounts/") :]
+    try:
+        return int(mid)
+    except ValueError:
+        return None
+
+
+def _handle_overview(
+    store: ExternalGroupStore, *, hours: float = 24.0
+) -> tuple[dict[str, Any], int]:
+    try:
+        stats = store.pipeline_ops_stats(hours=hours)
+    except Exception:
+        logger.exception("运营统计聚合失败")
+        empty_dur = {
+            "count": 0,
+            "avg_seconds": 0,
+            "p50_seconds": 0,
+            "p95_seconds": 0,
+            "avg_minutes": 0.0,
+            "p50_minutes": 0.0,
+            "p95_minutes": 0.0,
+        }
+        empty_stage = {
+            "success": 0,
+            "failed": 0,
+            "success_rate": 0.0,
+            "fail_rate": 0.0,
+            "duration": empty_dur,
+        }
+        stats = {
+            "hours": float(hours or 0),
+            "backlog": {
+                "register_pending": 0,
+                "register_running": 0,
+                "awaiting_review": 0,
+                "activation_pending": 0,
+                "form_pending": 0,
+                "activation_pending_no_url": 0,
+                "activation_pending_has_url": 0,
+                "activation_failed": 0,
+                "form_failed": 0,
+            },
+            "stages": {
+                "register": {**empty_stage, "s03a_duration": empty_dur},
+                "activation": dict(empty_stage),
+                "form": dict(empty_stage),
+            },
+            "extras": {
+                "created": 0,
+                "e2e_filled": 0,
+                "e2e_rate": 0.0,
+                "e2e_avg_minutes": 0.0,
+                "review_rejected": 0,
+                "review_approved": 0,
+                "review_reject_rate": 0.0,
+                "id_already_registered": 0,
+                "form_retries": 0,
+                "source": {"admin": 0, "wework": 0, "other": 0},
+            },
+            "daily": [],
+        }
+    from src.browser.cdp_lock import cdp_lease_snapshot
+    from src.wework.worker_heartbeat import read_worker_heartbeat
+
+    form_poll = float(getattr(settings, "icris_form_poll_seconds", 60.0) or 60.0)
+    stale_after = max(120.0, 2.0 * form_poll)
+    stats["health"] = {
+        "worker": read_worker_heartbeat(stale_after_s=stale_after),
+        "cdp": cdp_lease_snapshot(),
+    }
+    return _ok(**stats)
+
+
+def _handle_sessions_list(
+    store: ExternalGroupStore, channel: str
+) -> tuple[dict[str, Any], int]:
+    rows = store.list_all_materials_summary(channel=channel)
+    items = []
+    for r in rows:
+        item = dict(r)
+        item["label"] = _session_label(r)
+        items.append(item)
+    return _ok(items=items, channel=channel)
+
+
+def _handle_session_detail(
+    store: ExternalGroupStore, roomid: str
+) -> tuple[dict[str, Any], int]:
+    roomid = (roomid or "").strip()
+    if not roomid:
+        return _err("roomid required", 400)
+    group = store.get_group(roomid)
+    if not group:
+        return _err("session not found", 404)
+    materials = store.get_materials(roomid)
+    material_items = []
+    for row in materials.values():
+        item = dict(row)
+        fv = str(item.get("field_value") or "")
+        item["value_text"] = fv
+        material_items.append(item)
+    material_items.sort(key=lambda x: str(x.get("field_key") or ""))
+    out = dict(group)
+    out["label"] = _session_label(group)
+    out["channel"] = (
+        "kf" if str(group.get("roomid") or "").startswith("kf:") else "group"
+    )
+    return _ok(session=out, materials=material_items)
+
+
+def _handle_jobs_list(
+    store: ExternalGroupStore,
+    *,
+    status: str,
+    limit: int,
+    offset: int = 0,
+    keyword: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    company_name: str = "",
+    director_name: str = "",
+    id_number: str = "",
+) -> tuple[dict[str, Any], int]:
+    offset = max(0, int(offset or 0))
+    total = store.count_registration_jobs(
+        status=status,
+        keyword=keyword,
+        date_from=date_from,
+        date_to=date_to,
+        company_name=company_name,
+        director_name=director_name,
+        id_number=id_number,
+    )
+    items = store.list_registration_jobs(
+        limit=limit,
+        offset=offset,
+        slim_list=True,
+        status=status,
+        keyword=keyword,
+        date_from=date_from,
+        date_to=date_to,
+        company_name=company_name,
+        director_name=director_name,
+        id_number=id_number,
+    )
+    slim: list[dict[str, Any]] = []
+    for it in items:
+        row = dict(it)
+        row.pop("payload_json", None)
+        row.pop("result_messages", None)
+        row["company_name_cn"] = str(row.get("company_name_cn") or "")
+        row["company_name_en"] = str(row.get("company_name_en") or "")
+        row["director_name"] = str(row.get("director_name") or "")
+        row["id_type"] = _id_type_display(row.get("id_type") or "")
+        row["id_number"] = str(row.get("id_number") or "")
+        row["icris_username"] = str(row.get("icris_username") or "")
+        row["icris_password"] = str(row.get("icris_password") or "")
+        row["contact_email"] = str(row.get("contact_email") or "")
+        row["contact_phone"] = str(row.get("contact_phone") or "")
+        row["progress"] = job_pipeline_progress(row)
+        slim.append(row)
+    return _ok(
+        items=slim,
+        status=status or "all",
+        limit=limit,
+        offset=offset,
+        total=total,
+    )
+
+
+_FIELD_LABELS: dict[str, str] = {
+    "company_name_cn": "公司中文名",
+    "company_name_en": "公司英文名",
+    "registered_capital": "注册资本",
+    "business_desc": "经营范围",
+    "br_certificate_years": "商业登记证年期",
+    "office.flat_floor": "办事处室/楼/座",
+    "office.building": "办事处大厦",
+    "office.street": "办事处街道",
+    "office.district": "办事处区",
+    "registered_office_cn": "注册地址（中文）",
+    "registered_office_en": "注册地址（英文）",
+    "contact.email": "联络邮箱",
+    "contact.phone": "联络电话",
+    "director.name": "董事兼股东姓名",
+    "director.name_cn": "董事中文名",
+    "director.name_en": "董事英文名",
+    "director.surname_en": "英文姓",
+    "director.given_en": "英文名",
+    "director.id_type": "证件类型",
+    "director.id_number": "证件号码",
+    "director.issuing_country": "证件签发地",
+    "director.address_cn": "住址（中文）",
+    "director.address_en": "住址（英文）",
+    "director.address_flat": "住址室/楼/座",
+    "director.address_building": "住址大厦",
+    "director.address_street": "住址街道",
+    "director.address_region": "住址区/市/省",
+    "director.address_country": "住址国家",
+    "director.address_is_hk": "住址是否香港",
+    "applicant.name": "申请人姓名",
+    "applicant.name_cn": "申请人中文名",
+    "applicant.name_en": "申请人英文名",
+    "applicant.email": "申请人电邮",
+    "applicant.phone": "申请人电话",
+    "applicant.id_type": "申请人证件类型",
+    "applicant.id_number": "申请人证件号码",
+    "secretary.name_en": "秘书名称",
+    "secretary.br_number": "秘书商业登记号",
+    "secretary.license_number": "秘书牌照号",
+    "secretary.company_number": "秘书公司编号",
+    "icris_account.username": "ICRIS 用户名",
+    "icris_account.password": "ICRIS 密码",
+    "identity_proof.id_type": "身份证明类型",
+    "identity_proof.id_number": "身份证明号码",
+    "identity_proof.document_files": "证件文件",
+    "id_card_front": "身份证正面",
+    "id_card_back": "身份证反面",
+    "id_card_handheld": "手持身份证",
+    "passport": "护照",
+    "taiwan_id": "台湾身份证",
+    "director_name_cn": "董事中文名",
+    "director_name_en": "董事英文名",
+    "issuing_country": "证件签发地",
+}
+
+_ID_TYPE_LABELS = {
+    "PRC_ID": "内地身份证",
+    "HKID": "香港身份证",
+    "PASSPORT": "护照",
+}
+
+PIPELINE_STEPS: tuple[tuple[str, str], ...] = (
+    ("queued", "排队"),
+    ("registering", "注册中"),
+    ("review", "待审核"),
+    ("registered", "注册完成"),
+    ("activating", "待激活"),
+    ("activated", "已激活"),
+    ("form_pending", "待填表"),
+    ("form_filled", "已填表"),
+)
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _norm_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _id_type_display(raw: Any) -> str:
+    text = _norm_text(raw)
+    if not text:
+        return ""
+    return _ID_TYPE_LABELS.get(text, text)
+
+
+def _country_display(raw: Any) -> str:
+    text = _norm_text(raw)
+    if not text:
+        return ""
+    try:
+        from src.materials.countries import country_names, normalize_issuing_iso
+
+        code = normalize_issuing_iso(text) or text.upper()
+        zh, _en = country_names(code)
+        if zh:
+            return f"{zh} ({code})"
+        return text
+    except Exception:
+        return text
+
+
+def _yes_no(raw: Any) -> str:
+    text = _norm_text(raw).lower()
+    if text in ("1", "true", "yes", "y"):
+        return "是"
+    if text in ("0", "false", "no", "n"):
+        return "否"
+    return _norm_text(raw)
+
+
+def job_pipeline_progress(job: dict[str, Any]) -> dict[str, Any]:
+    """由注册/激活/填表状态推导 ICRIS 流程当前步。"""
+    status = str(job.get("status") or "").lower()
+    review = str(job.get("review_status") or "").lower()
+    act = str(job.get("activation_status") or "").lower()
+    form = str(job.get("form_status") or "").lower()
+    last_error = str(job.get("last_error") or "").strip()
+
+    failed = False
+    detail = ""
+    step = "queued"
+    label = "排队"
+
+    if status == "pending":
+        step, label = "queued", "排队"
+    elif status == "running":
+        step, label = "registering", "注册中"
+    elif status == "awaiting_review":
+        step, label = "review", "待审核"
+    elif review == "rejected":
+        failed = True
+        step, label = "review", "已拒绝"
+        detail = last_error
+    elif status == "failed":
+        failed = True
+        step, label = "registering", "已失败"
+        detail = last_error
+    elif status == "cancelled":
+        failed = True
+        step, label = "registering", "已取消"
+        detail = last_error
+    elif status == "succeeded":
+        if form == "filled":
+            step, label = "form_filled", "已填表"
+        elif form == "failed":
+            failed = True
+            step, label = "form_pending", "填表失败"
+            detail = last_error
+        elif form == "pending":
+            step, label = "form_pending", "待填表"
+        elif act == "activating":
+            step, label = "activating", "激活中"
+        elif act == "pending":
+            step, label = "activating", "待激活"
+        elif act == "failed":
+            failed = True
+            step, label = "activating", "激活失败"
+            detail = last_error
+        elif act == "activated":
+            step, label = "activated", "已激活"
+        else:
+            step, label = "registered", "注册完成"
+    else:
+        step, label = "queued", status or "排队"
+
+    return {
+        "step": step,
+        "label": label,
+        "failed": failed,
+        "detail": detail[:300] if detail else "",
+    }
+
+
+def _flatten_payload_fields(payload: dict[str, Any]) -> list[dict[str, str]]:
+    """将 company_data 展平为详情字段（含中文 label）。"""
+    fields: list[dict[str, str]] = []
+
+    def add(
+        key: str,
+        value: Any,
+        label: str | None = None,
+        group: str = "company",
+    ) -> None:
+        if value is None:
+            return
+        if isinstance(value, (list, tuple)):
+            text = "；".join(str(x).strip() for x in value if str(x).strip())
+        else:
+            text = str(value).strip()
+        if not text:
+            return
+        fields.append(
+            {
+                "key": key,
+                "label": label or _FIELD_LABELS.get(key, key),
+                "value": text,
+                "group": group,
+            }
+        )
+
+    add("company_name_cn", payload.get("company_name_cn"), group="company")
+    add("company_name_en", payload.get("company_name_en"), group="company")
+
+    sc = payload.get("share_capital") or {}
+    if isinstance(sc, dict) and sc.get("total_shares") is not None:
+        cur = str(sc.get("currency") or "HKD")
+        add("registered_capital", f"{sc.get('total_shares')} {cur}", group="company")
+    else:
+        add("registered_capital", payload.get("registered_capital"), group="company")
+
+    add(
+        "business_desc",
+        payload.get("business_nature_desc") or payload.get("business_desc"),
+        group="company",
+    )
+    years = payload.get("br_certificate_years")
+    if years not in (None, ""):
+        add("br_certificate_years", f"{years} 年", group="company")
+
+    office = _as_dict(payload.get("registered_office"))
+    if office:
+        add("office.flat_floor", office.get("flat_floor"), group="office")
+        add("office.building", office.get("building"), group="office")
+        add("office.street", office.get("street"), group="office")
+        add("office.district", office.get("district"), group="office")
+        add(
+            "registered_office_cn",
+            office.get("street_cn") or payload.get("registered_office_cn"),
+            group="office",
+        )
+        add(
+            "registered_office_en",
+            office.get("street_en")
+            or office.get("street")
+            or payload.get("registered_office_en"),
+            group="office",
+        )
+    else:
+        add("registered_office_cn", payload.get("registered_office_cn"), group="office")
+        add("registered_office_en", payload.get("registered_office_en"), group="office")
+
+    contact = _as_dict(payload.get("contact"))
+    add("contact.email", contact.get("email"), group="contact")
+    add("contact.phone", contact.get("phone"), group="contact")
+
+    directors = payload.get("directors") or []
+    director = directors[0] if isinstance(directors, list) and directors else {}
+    director = _as_dict(director)
+    applicant = _as_dict(payload.get("applicant"))
+
+    name_cn = director.get("name_cn") or applicant.get("name_cn")
+    name_en = director.get("name_en") or director.get("name") or applicant.get("name_en")
+    add("director.name_cn", name_cn, group="director")
+    add("director.name_en", name_en, group="director")
+    if not name_cn and not name_en:
+        add(
+            "director.name",
+            applicant.get("director_name") or applicant.get("name_cn"),
+            group="director",
+        )
+    add(
+        "director.surname_en",
+        director.get("surname_en") or applicant.get("surname_en"),
+        group="director",
+    )
+    add(
+        "director.given_en",
+        director.get("given_en") or applicant.get("given_en"),
+        group="director",
+    )
+    add(
+        "director.id_type",
+        _id_type_display(applicant.get("id_type") or director.get("id_type")),
+        group="director",
+    )
+    add(
+        "director.id_number",
+        applicant.get("id_number") or director.get("id_number"),
+        group="director",
+    )
+    add(
+        "director.issuing_country",
+        _country_display(
+            applicant.get("issuing_country") or director.get("issuing_country")
+        ),
+        group="director",
+    )
+    add(
+        "director.address_cn",
+        director.get("address_cn") or applicant.get("address_cn"),
+        group="director",
+    )
+    add(
+        "director.address_en",
+        director.get("address_en") or applicant.get("address_en"),
+        group="director",
+    )
+    add(
+        "director.address_flat",
+        director.get("address_flat") or applicant.get("address_flat"),
+        group="director",
+    )
+    add(
+        "director.address_building",
+        director.get("address_building") or applicant.get("address_building"),
+        group="director",
+    )
+    add(
+        "director.address_street",
+        director.get("address_street") or applicant.get("address_street"),
+        group="director",
+    )
+    add(
+        "director.address_region",
+        director.get("address_region") or applicant.get("address_region"),
+        group="director",
+    )
+    addr_country = director.get("address_country") or applicant.get("address_country")
+    add(
+        "director.address_country",
+        _country_display(addr_country) if addr_country else "",
+        group="director",
+    )
+    hk_flag = director.get("address_is_hk")
+    if hk_flag in (None, ""):
+        hk_flag = applicant.get("address_is_hk")
+    add("director.address_is_hk", _yes_no(hk_flag) if hk_flag not in (None, "") else "", group="director")
+
+    def _differs(left: Any, right: Any) -> bool:
+        return _norm_text(left).lower() != _norm_text(right).lower() and bool(
+            _norm_text(left)
+        )
+
+    app_name = (
+        applicant.get("director_name")
+        or applicant.get("name_cn")
+        or applicant.get("name_en")
+    )
+    dir_name = name_cn or name_en
+    if _differs(app_name, dir_name):
+        add("applicant.name", app_name, group="applicant")
+    if _differs(applicant.get("name_cn"), name_cn):
+        add("applicant.name_cn", applicant.get("name_cn"), group="applicant")
+    if _differs(applicant.get("name_en"), name_en):
+        add("applicant.name_en", applicant.get("name_en"), group="applicant")
+    if _differs(applicant.get("email"), contact.get("email") or director.get("email")):
+        add("applicant.email", applicant.get("email"), group="applicant")
+    if _differs(applicant.get("phone"), contact.get("phone")):
+        add("applicant.phone", applicant.get("phone"), group="applicant")
+
+    secretary = _as_dict(payload.get("company_secretary"))
+    add("secretary.name_en", secretary.get("name_en") or secretary.get("name_cn"), group="secretary")
+    add("secretary.br_number", secretary.get("br_number"), group="secretary")
+    add("secretary.license_number", secretary.get("license_number"), group="secretary")
+    add("secretary.company_number", secretary.get("company_number"), group="secretary")
+
+    account = _as_dict(payload.get("icris_account"))
+    add("icris_account.username", account.get("username"), group="icris")
+    add("icris_account.password", account.get("password"), group="icris")
+
+    proof = _as_dict(payload.get("identity_proof"))
+    add(
+        "identity_proof.id_type",
+        _id_type_display(proof.get("id_type")),
+        group="identity",
+    )
+    add("identity_proof.id_number", proof.get("id_number"), group="identity")
+    docs = proof.get("document_files") or []
+    if docs:
+        add("identity_proof.document_files", docs, group="identity")
+
+    return fields
+
+
+def _normalize_job_messages(
+    raw_msgs: Any, *, last_error: str = ""
+) -> list[dict[str, str]]:
+    """Parse result_messages into [{level, message, time?}]; attach last_error if missing."""
+    import json
+
+    messages: list[dict[str, str]] = []
+    if isinstance(raw_msgs, str) and raw_msgs.strip():
+        try:
+            parsed = json.loads(raw_msgs)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, dict):
+                    level = str(item.get("level") or "INFO").upper()
+                    msg = str(item.get("message") or "").strip()
+                    if not msg:
+                        continue
+                    entry: dict[str, str] = {"level": level, "message": msg}
+                    t = str(item.get("time") or "").strip()
+                    if t:
+                        entry["time"] = t
+                    phase = str(item.get("phase") or "").strip()
+                    if phase:
+                        entry["phase"] = phase
+                    messages.append(entry)
+                else:
+                    text = str(item or "").strip()
+                    if text:
+                        messages.append({"level": "INFO", "message": text})
+    err = str(last_error or "").strip()
+    if err:
+        already = any(
+            m.get("level") in ("ERROR", "CRITICAL") and err in str(m.get("message") or "")
+            for m in messages[-5:]
+        )
+        if not already:
+            messages.append({"level": "ERROR", "message": err})
+    return messages
+
+
+def _handle_job_detail(
+    store: ExternalGroupStore, job_id: int
+) -> tuple[dict[str, Any], int]:
+    import json
+
+    job = store.get_registration_job(job_id)
+    if not job:
+        return _err("job not found", 404)
+    out = dict(job)
+    payload: dict[str, Any] = {}
+    raw = out.get("payload_json") or ""
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                payload = parsed
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+    messages = _normalize_job_messages(
+        out.get("result_messages") or "",
+        last_error=str(out.get("last_error") or ""),
+    )
+    fields = _flatten_payload_fields(payload) if payload else []
+    # 无 payload 时回退 materials（中文 label）
+    if not fields:
+        materials = store.get_materials(str(out.get("roomid") or ""))
+        for key in sorted(materials.keys()):
+            row = materials[key]
+            val = str(row.get("field_value") or "").strip()
+            fpath = str(row.get("file_path") or "").strip()
+            label = _FIELD_LABELS.get(key, key)
+            if fpath:
+                fields.append({"key": key, "label": label, "value": fpath, "group": "identity"})
+            elif val:
+                fields.append({"key": key, "label": label, "value": val, "group": "company"})
+    out["progress"] = job_pipeline_progress(out)
+    return _ok(
+        job=out,
+        payload=payload,
+        fields=fields,
+        messages=messages,
+        progress=out["progress"],
+    )
+
+
+def _handle_job_delete(
+    store: ExternalGroupStore, job_id: int
+) -> tuple[dict[str, Any], int]:
+    job = store.delete_registration_job(job_id)
+    if not job:
+        return _err("job not found", 404)
+    status = str(job.get("status") or "")
+    if status not in ("failed", "cancelled"):
+        return _err(
+            f"cannot delete (status={status}; failed/cancelled only)",
+            409,
+        )
+    return _ok(message=f"deleted #{job_id}")
+
+
+def _handle_job_cancel(
+    store: ExternalGroupStore, job_id: int
+) -> tuple[dict[str, Any], int]:
+    job = store.cancel_registration_job(job_id)
+    if not job:
+        return _err("job not found", 404)
+    if job.get("status") != "cancelled":
+        return _err(
+            f"cannot cancel (status={job.get('status')}; pending/running only)",
+            409,
+        )
+    rid = str(job.get("roomid") or "")
+    if rid:
+        store.set_group_status(rid, "FAILED")
+    return _ok(job=job, message=f"cancelled #{job_id}")
+
+
+def _handle_job_requeue(
+    store: ExternalGroupStore, job_id: int
+) -> tuple[dict[str, Any], int]:
+    job = store.requeue_registration_job(job_id)
+    if not job:
+        return _err("job not found", 404)
+    if job.get("status") != "pending":
+        return _err(
+            f"cannot requeue (status={job.get('status')}; "
+            "need failed/cancelled and no active job)",
+            409,
+        )
+    rid = str(job.get("roomid") or "")
+    if rid:
+        store.set_group_status(rid, "QUEUED")
+    return _ok(job=job, message=f"requeued #{job_id}")
+
+
+def _handle_job_approve(
+    store: ExternalGroupStore, job_id: int
+) -> tuple[dict[str, Any], int]:
+    job = store.approve_job_submit(job_id)
+    if not job:
+        return _err("job not found", 404)
+    if job.get("review_status") != "approved":
+        return _err(
+            f"cannot approve (status={job.get('status')}; need awaiting_review)",
+            409,
+        )
+    return _ok(job=job, message=f"approved #{job_id}")
+
+
+def _handle_job_reject(
+    store: ExternalGroupStore, job_id: int
+) -> tuple[dict[str, Any], int]:
+    job = store.reject_job_submit(job_id)
+    if not job:
+        return _err("job not found", 404)
+    if job.get("review_status") != "rejected":
+        return _err(
+            f"cannot reject (status={job.get('status')}; need awaiting_review)",
+            409,
+        )
+    return _ok(job=job, message=f"rejected #{job_id}")
+
+
+def _handle_job_form_retry(
+    store: ExternalGroupStore, job_id: int
+) -> tuple[dict[str, Any], int]:
+    job = store.reset_job_form_retry(job_id)
+    if not job:
+        return _err("job not found", 404)
+    if job.get("form_status") != "pending":
+        return _err(
+            f"cannot retry form (form_status={job.get('form_status')}; "
+            "need failed)",
+            409,
+        )
+    return _ok(job=job, message=f"form retry #{job_id}")
+
+
+def _handle_email_account_upsert(
+    store: ExternalGroupStore, body: dict[str, Any]
+) -> tuple[dict[str, Any], int]:
+    email = str(body.get("email_address") or "").strip().lower()
+    imap_host = str(body.get("imap_host") or "").strip()
+    username = str(body.get("username") or "").strip()
+    password = str(body.get("password") or "").strip()
+    label = str(body.get("label") or "").strip()
+    try:
+        imap_port = int(body.get("imap_port") or 993)
+    except (TypeError, ValueError):
+        return _err("imap_port 无效", 400)
+    if imap_port <= 0 or imap_port > 65535:
+        return _err("imap_port 无效", 400)
+
+    account_id = None
+    raw_id = body.get("id")
+    if raw_id not in (None, "", 0, "0"):
+        try:
+            account_id = int(raw_id)
+        except (TypeError, ValueError):
+            return _err("invalid id", 400)
+
+    enabled = None
+    if "enabled" in body and body.get("enabled") is not None:
+        enabled = 1 if body.get("enabled") in (True, 1, "1", "true", "True") else 0
+
+    if not email or not imap_host or not username:
+        return _err("email_address, imap_host, username 必填", 400)
+    if not password and not account_id:
+        return _err("email_address, imap_host, username, password 必填", 400)
+    try:
+        account = store.upsert_email_account(
+            email,
+            imap_host,
+            imap_port,
+            username,
+            password,
+            label,
+            account_id=account_id,
+            enabled=enabled,
+        )
+    except ValueError as e:
+        msg = str(e) or "save failed"
+        code = 404 if msg == "account not found" else 400
+        return _err(msg, code)
+    return _ok(account=account, message="saved")
+
+
+def _handle_email_account_delete(
+    store: ExternalGroupStore, account_id: int
+) -> tuple[dict[str, Any], int]:
+    ok = store.delete_email_account(account_id)
+    if not ok:
+        return _err("account not found", 404)
+    return _ok(message=f"deleted #{account_id}")
+
+
+def _handle_email_account_test(
+    store: ExternalGroupStore, account_id: int
+) -> tuple[dict[str, Any], int]:
+    accounts = store.list_email_accounts()
+    account = next((a for a in accounts if a["id"] == account_id), None)
+    if not account:
+        return _err("account not found", 404)
+    password = str(account.get("password") or "").strip()
+    if not password:
+        return _err("未保存授权码，请编辑后重新填写", 400)
+    try:
+        from src.email.imap_client import format_imap_connect_error, open_imap_inbox
+
+        mail = None
+        try:
+            mail = open_imap_inbox(
+                str(account["imap_host"]),
+                int(account["imap_port"]),
+                str(account["username"]),
+                password,
+            )
+            if str(getattr(mail, "state", "") or "") != "SELECTED":
+                raise RuntimeError(
+                    f"无法打开收件箱: IMAP 仍停在 {getattr(mail, 'state', '') or 'AUTH'}"
+                )
+        finally:
+            if mail is not None:
+                try:
+                    mail.logout()
+                except Exception:
+                    pass
+        return _ok(message="IMAP 登录成功，已打开收件箱")
+    except Exception as e:
+        from src.email.imap_client import format_imap_connect_error
+
+        return _err(format_imap_connect_error(e), 400)
+
+
+def _handle_icris_activate_probe(
+    store: ExternalGroupStore, body: dict[str, Any]
+) -> tuple[dict[str, Any], int]:
+    username = str(body.get("username") or "").strip()
+    email = str(body.get("email") or "").strip()
+    password = str(body.get("password") or "")
+    if not username or not email:
+        return _err("账号和邮箱必填", 400)
+    from src.email.icris_activate import run_icris_activation_probe
+
+    result = run_icris_activation_probe(
+        store, username=username, email=email, password=password
+    )
+    detail = str(result.get("detail") or "")
+    if "未配置 IMAP" in detail:
+        return _err(detail, 400)
+    return _ok(
+        found=bool(result.get("found")),
+        activated=bool(result.get("ok")),
+        password_source=str(result.get("password_source") or "none"),
+        detail=detail,
+        url=str(result.get("url") or ""),
+        message=detail or ("激活成功" if result.get("ok") else "探测完成"),
+    )
+
+
+def _handle_default_office_get(
+    store: ExternalGroupStore,
+) -> tuple[dict[str, Any], int]:
+    import json
+
+    raw = store.get_system_setting("icris_default_office") or ""
+    try:
+        data = json.loads(raw) if raw else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        data = {}
+    result = {
+        "flat_floor": data.get("flat_floor", ""),
+        "building": data.get("building", ""),
+        "street": data.get("street", ""),
+        "district": data.get("district", ""),
+        "secretary_br_no": data.get("secretary_br_no", ""),
+        "secretary_license_no": data.get("secretary_license_no", ""),
+        "secretary_company_no": data.get("secretary_company_no", ""),
+    }
+    return _ok(**result)
+
+
+def _handle_default_office_put(
+    store: ExternalGroupStore, body: dict[str, Any]
+) -> tuple[dict[str, Any], int]:
+    import json
+
+    # 合并已有配置，避免 PUT 只传部分字段时抹掉秘书公司信息
+    raw = store.get_system_setting("icris_default_office") or ""
+    try:
+        existing = json.loads(raw) if raw else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        existing = {}
+    if not isinstance(existing, dict):
+        existing = {}
+
+    keys = (
+        "flat_floor",
+        "building",
+        "street",
+        "district",
+        "secretary_br_no",
+        "secretary_license_no",
+        "secretary_company_no",
+    )
+    data = dict(existing)
+    for key in keys:
+        if key in body:
+            data[key] = str(body.get(key) or "").strip()
+    store.set_system_setting(
+        "icris_default_office", json.dumps(data, ensure_ascii=False)
+    )
+    result = {k: str(data.get(k) or "") for k in keys}
+    return _ok(**result, message="已更新")
+
+
+def _handle_quality(
+    store: ExternalGroupStore, *, hours: float
+) -> tuple[dict[str, Any], int]:
+    hours = max(1.0, float(hours or 24.0))
+    try:
+        stats = store.conversation_quality_stats(hours=hours)
+    except Exception:
+        stats = {
+            "hours": hours,
+            "agent_runs_total": 0,
+            "actions": {},
+            "reply_rate": 0.0,
+            "avg_confidence": 0.0,
+            "low_confidence_count": 0,
+            "qa_latency_ms": {},
+            "intent_routes": {},
+        }
+    try:
+        low = store.list_low_confidence_runs(limit=50, threshold=0.5)
+    except Exception:
+        low = []
+    return _ok(stats=stats, low_confidence_runs=low, hours=hours)

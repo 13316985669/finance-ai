@@ -1,0 +1,558 @@
+export type ApiOk<T extends Record<string, unknown> = Record<string, unknown>> = {
+  ok: true;
+} & T;
+
+export type ApiErr = { ok: false; error: string };
+
+export type DurationStats = {
+  count: number;
+  avg_seconds: number;
+  p50_seconds: number;
+  p95_seconds: number;
+  avg_minutes: number;
+  p50_minutes: number;
+  p95_minutes: number;
+};
+
+export type StageStats = {
+  success: number;
+  failed: number;
+  success_rate: number;
+  fail_rate: number;
+  duration: DurationStats;
+  s03a_duration?: DurationStats;
+};
+
+export type DailyPoint = {
+  date: string;
+  created: number;
+  succeeded: number;
+  failed: number;
+  activated: number;
+  form_filled: number;
+};
+
+export type WorkerHealth = {
+  present: boolean;
+  stale: boolean;
+  age_seconds: number | null;
+  updated_at?: string;
+  pid?: number;
+  label?: string;
+};
+
+export type CdpHealth = {
+  busy: boolean;
+  label: string;
+  owner?: string;
+  pid?: number;
+  age_seconds?: number | null;
+};
+
+export type OverviewResponse = ApiOk<{
+  hours: number;
+  backlog: {
+    register_pending: number;
+    register_running: number;
+    awaiting_review: number;
+    activation_pending: number;
+    form_pending: number;
+    activation_pending_no_url?: number;
+    activation_pending_has_url?: number;
+    activation_failed?: number;
+    form_failed?: number;
+  };
+  stages: {
+    register: StageStats;
+    activation: StageStats;
+    form: StageStats;
+  };
+  extras: {
+    created: number;
+    e2e_filled: number;
+    e2e_rate: number;
+    e2e_avg_minutes: number;
+    review_rejected: number;
+    review_approved: number;
+    review_reject_rate: number;
+    id_already_registered: number;
+    form_retries: number;
+    source: { admin: number; wework: number; other: number };
+  };
+  daily: DailyPoint[];
+  health?: {
+    worker: WorkerHealth;
+    cdp: CdpHealth;
+  };
+}>;
+
+export type SessionsResponse = ApiOk<{
+  items: SessionSummary[];
+  channel: string;
+}>;
+
+export type SessionSummary = {
+  roomid: string;
+  name?: string;
+  status?: string;
+  company_name?: string;
+  open_kfid?: string;
+  material_count?: number;
+  channel?: string;
+  label?: string;
+};
+
+export type SessionDetailResponse = ApiOk<{
+  session: SessionSummary & Record<string, unknown>;
+  materials: MaterialRow[];
+}>;
+
+export type MaterialRow = {
+  field_key?: string;
+  status?: string;
+  field_value?: string;
+  value_text?: string;
+  file_path?: string;
+  updated_at?: string;
+};
+
+export type JobsResponse = ApiOk<{
+  items: JobRow[];
+  status: string;
+  limit: number;
+  offset: number;
+  total: number;
+}>;
+
+export type JobField = { key: string; label?: string; value: string; group?: string };
+
+export type JobProgress = {
+  step: string;
+  label: string;
+  failed?: boolean;
+  detail?: string;
+};
+
+export type JobRow = {
+  id: number;
+  roomid: string;
+  status: string;
+  review_status?: string;
+  attempts?: number;
+  max_attempts?: number;
+  dry_run?: number | boolean;
+  allow_submit?: number | boolean;
+  last_error?: string;
+  screenshot_path?: string;
+  esubmit_screenshot_path?: string;
+  success_screenshot_path?: string;
+  activation_status?: string;
+  form_status?: string;
+  form_filled_at?: string;
+  form_screenshot_path?: string;
+  activation_screenshot_path?: string;
+  activation_checked_at?: string;
+  activation_url_saved_at?: string;
+  activation_activated_at?: string;
+  activation_pending_at?: string;
+  activation_attempts?: number;
+  activation_url?: string;
+  company_name?: string;
+  company_name_cn?: string;
+  company_name_en?: string;
+  director_name?: string;
+  id_type?: string;
+  id_number?: string;
+  icris_username?: string;
+  icris_password?: string;
+  contact_email?: string;
+  contact_phone?: string;
+  fields?: JobField[];
+  progress?: JobProgress;
+  source?: string;
+  updated_at?: string;
+  finished_at?: string;
+  created_at?: string;
+  started_at?: string;
+  run_duration?: string;
+  s03a_duration?: string;
+  nnc1_duration?: string;
+  id_already_registered?: number | boolean;
+};
+
+export type JobLogLine = {
+  level: string;
+  message: string;
+  time?: string;
+  phase?: string;
+};
+
+export type JobDetailResponse = ApiOk<{
+  job: JobRow & {
+    payload_json?: string;
+    result_messages?: string;
+    package_dir?: string;
+    customer_id?: string;
+    progress?: JobProgress;
+  };
+  payload: Record<string, unknown>;
+  fields: JobField[];
+  messages: Array<JobLogLine | string>;
+  progress?: JobProgress;
+}>;
+
+export type QualityResponse = ApiOk<{
+  hours: number;
+  stats: Record<string, unknown>;
+  low_confidence_runs: LowRun[];
+}>;
+
+export type LowRun = {
+  id?: string;
+  roomid?: string;
+  question?: string;
+  action?: string;
+  confidence?: number;
+  answer_score?: number;
+  retrieval_score?: number;
+  duration_ms?: number;
+  created_at?: string;
+};
+
+export type RunnerFile = { name: string; data_url: string };
+
+export type EmailAccount = {
+  id: number;
+  email_address: string;
+  imap_host: string;
+  imap_port: number;
+  username: string;
+  password: string;
+  label?: string;
+  enabled?: number | boolean;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type WeworkSendModes = {
+  configured: boolean;
+  kf_configured: boolean;
+  send_mode: "kf" | "mass" | "webhook" | "appchat" | string;
+  channel: string;
+  webhook_url_set: boolean;
+  default_owner_set: boolean;
+};
+
+export type DefaultOffice = {
+  flat_floor: string;
+  building: string;
+  street: string;
+  district: string;
+  secretary_br_no?: string;
+  secretary_license_no?: string;
+  secretary_company_no?: string;
+};
+
+export type WeworkSendResponse = ApiOk<{
+  plan: string;
+  result: Record<string, unknown>;
+}>;
+
+export type RunnerStatus = {
+  status: "idle" | "running" | "succeeded" | "failed" | "pending";
+  started_at?: string;
+  finished_at?: string;
+  messages?: Array<JobLogLine | string>;
+  error?: string;
+  company_name?: string;
+  case_id?: string;
+  job_id?: number | null;
+  dry_run?: boolean;
+};
+
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function redirectToLogin() {
+  const base = "/admin/login";
+  if (!window.location.pathname.endsWith("/login")) {
+    window.location.assign(base);
+  }
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(path, {
+    credentials: "include",
+    ...init,
+    headers: {
+      Accept: "application/json",
+      ...(init?.body ? { "Content-Type": "application/json" } : {}),
+      ...(init?.headers || {}),
+    },
+  });
+  const data = (await res.json().catch(() => ({
+    ok: false,
+    error: `HTTP ${res.status}`,
+  }))) as ApiErr | T;
+
+  if (res.status === 401 && !path.includes("/admin/api/login") && !path.includes("/admin/api/me")) {
+    redirectToLogin();
+    throw new ApiError((data as ApiErr).error || "unauthorized", 401);
+  }
+
+  if (!res.ok || (data as ApiErr).ok === false) {
+    const err = (data as ApiErr).error || `HTTP ${res.status}`;
+    throw new ApiError(err, res.status);
+  }
+  return data as T;
+}
+
+export const api = {
+  me: () =>
+    request<ApiOk<{ authenticated: boolean; username: string }>>("/admin/api/me"),
+  login: (username: string, password: string) =>
+    request<ApiOk<{ username: string }>>("/admin/api/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }),
+  logout: () =>
+    request<ApiOk>("/admin/api/logout", { method: "POST" }),
+  overview: (hours = 24) =>
+    request<OverviewResponse>(`/admin/api/overview?hours=${hours}`),
+  sessions: (channel = "all") =>
+    request<SessionsResponse>(`/admin/api/sessions?channel=${encodeURIComponent(channel)}`),
+  session: (roomid: string) =>
+    request<SessionDetailResponse>(`/admin/api/sessions/${encodeURIComponent(roomid)}`),
+  jobs: (
+    status = "",
+    limit = 50,
+    keyword = "",
+    dateFrom = "",
+    dateTo = "",
+    companyName = "",
+    directorName = "",
+    idNumber = "",
+    offset = 0,
+  ) => {
+    const q = new URLSearchParams();
+    if (status) q.set("status", status);
+    if (keyword) q.set("keyword", keyword);
+    if (dateFrom) q.set("date_from", dateFrom);
+    if (dateTo) q.set("date_to", dateTo);
+    if (companyName) q.set("company_name", companyName);
+    if (directorName) q.set("director_name", directorName);
+    if (idNumber) q.set("id_number", idNumber);
+    q.set("limit", String(limit));
+    q.set("offset", String(Math.max(0, offset)));
+    return request<JobsResponse>(`/admin/api/jobs?${q}`);
+  },
+  job: (id: number) =>
+    request<JobDetailResponse>(`/admin/api/jobs/${id}`),
+  jobScreenshotUrl: (
+    id: number,
+    type: "esubmit" | "success" | "fail" | "form" | "activation" = "fail",
+    opts?: { thumb?: boolean; v?: string },
+  ) => {
+    const q = new URLSearchParams({ type });
+    if (opts?.thumb) q.set("thumb", "1");
+    if (opts?.v) q.set("v", opts.v);
+    return `/admin/api/jobs/${id}/screenshot?${q}`;
+  },
+  cancelJob: (id: number) =>
+    request<ApiOk<{ job: JobRow; message: string }>>(
+      `/admin/api/jobs/${id}/cancel`,
+      { method: "POST" },
+    ),
+  requeueJob: (id: number) =>
+    request<ApiOk<{ job: JobRow; message: string }>>(
+      `/admin/api/jobs/${id}/requeue`,
+      { method: "POST" },
+    ),
+  approveJob: (id: number) =>
+    request<ApiOk<{ job: JobRow; message: string }>>(
+      `/admin/api/jobs/${id}/approve`,
+      { method: "POST" },
+    ),
+  rejectJob: (id: number) =>
+    request<ApiOk<{ job: JobRow; message: string }>>(
+      `/admin/api/jobs/${id}/reject`,
+      { method: "POST" },
+    ),
+  formRetryJob: (id: number) =>
+    request<ApiOk<{ ok: boolean; message?: string }>>(
+      `/admin/api/jobs/${id}/form-retry`,
+      { method: "POST" },
+    ),
+  deleteJob: (id: number) =>
+    request<ApiOk<{ message: string }>>(
+      `/admin/api/jobs/${id}`,
+      { method: "DELETE" },
+    ),
+  emailAccounts: {
+    list: () =>
+      request<ApiOk<{ items: EmailAccount[] }>>(`/admin/api/email-accounts`),
+    upsert: (data: Partial<EmailAccount> & Pick<EmailAccount, "email_address" | "imap_host" | "username">) =>
+      request<ApiOk<{ account: EmailAccount; message: string }>>(
+        `/admin/api/email-accounts`,
+        { method: "POST", body: JSON.stringify(data) },
+      ),
+    remove: (id: number) =>
+      request<ApiOk<{ message: string }>>(
+        `/admin/api/email-accounts/${id}`,
+        { method: "DELETE" },
+      ),
+    test: (id: number) =>
+      request<ApiOk<{ message: string }>>(
+        `/admin/api/email-accounts/${id}/test`,
+        { method: "POST" },
+      ),
+    activateProbe: (data: {
+      username: string;
+      email: string;
+      password?: string;
+    }) =>
+      request<
+        ApiOk<{
+          found: boolean;
+          activated: boolean;
+          password_source: string;
+          detail: string;
+          url?: string;
+          message?: string;
+        }>
+      >("/admin/api/icris-activate-probe", {
+        method: "POST",
+        body: JSON.stringify(data),
+      }),
+  },
+  defaultOffice: {
+    get: () => request<DefaultOffice>("/admin/api/default-office"),
+    update: (data: Partial<DefaultOffice>) =>
+      request<ApiOk>("/admin/api/default-office", {
+        method: "PUT",
+        body: JSON.stringify(data),
+      }),
+  },
+  quality: (hours = 24) =>
+    request<QualityResponse>(`/admin/api/quality?hours=${hours}`),
+  s03Countries: () =>
+    request<ApiOk<{ items: { label: string; value: string }[]; count?: number }>>(
+      "/admin/api/s03-countries"
+    ),
+  s03Districts: () =>
+    request<ApiOk<{ items: { label: string; value: string }[]; count?: number }>>(
+      "/admin/api/s03-districts"
+    ),
+  registerRunner: {
+    defaults: () =>
+      request<ApiOk<{ contact_email?: string; contact_phone?: string }>>(
+        "/admin/api/register-runner/defaults"
+      ),
+    submit: (
+      fields: Record<string, string>,
+      files: Record<string, RunnerFile>,
+      dry_run = false
+    ) =>
+      request<
+        ApiOk<{
+          case_id: string;
+          company_name: string;
+          job_id?: number;
+          dry_run?: boolean;
+        }>
+      >("/admin/api/register-runner/submit", {
+        method: "POST",
+        body: JSON.stringify({ fields, files, dry_run }),
+      }),
+    classifyId: (payload: { text?: string; paste_text?: string; id_number?: string }) =>
+      request<ApiOk<{ id_type?: string; id_number?: string }>>(
+        "/admin/api/register-runner/classify-id",
+        {
+          method: "POST",
+          body: JSON.stringify(payload),
+        }
+      ),
+    parsePaste: (payload: { text?: string; paste_text?: string }) =>
+      request<
+        ApiOk<{
+          fields?: Record<string, string>;
+          taiwan_passport?: boolean;
+          source?: string;
+        }>
+      >("/admin/api/register-runner/parse-paste", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }),
+    extractId: (payload: {
+      data_url: string;
+      filename?: string;
+      current_fields?: Record<string, string>;
+      fill_empty_only?: boolean;
+      expected_id_type?: string;
+    }) =>
+      request<
+        ApiOk<{
+          fields: Record<string, string>;
+          merged_fields?: Record<string, string>;
+          need_taiwan_id?: boolean;
+          hints?: string[];
+          vision?: {
+            id_type?: string;
+            type_label?: string;
+            confidence?: number;
+            issuing_country?: string;
+          };
+        }>
+      >("/admin/api/register-runner/extract-id", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }),
+    status: () =>
+      request<ApiOk<RunnerStatus>>("/admin/api/register-runner/status"),
+  },
+  idExtract: (payload: {
+    expected_id_type?: string;
+    data_url: string;
+    filename?: string;
+  }) =>
+    request<
+      ApiOk<{
+        fields: Record<string, string>;
+        display?: { key: string; label: string; value: string }[];
+        need_taiwan_id?: boolean;
+        type_mismatch?: boolean;
+        hints?: string[];
+        vision?: {
+          id_type?: string;
+          type_label?: string;
+          confidence?: number;
+          issuing_country?: string;
+        };
+      }>
+    >("/admin/api/id-extract", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  idTranslate: (payload: { text: string; engine: "google" | "youdao" | "deepl" }) =>
+    request<ApiOk<{ translated: string; engine: string }>>(
+      "/admin/api/id-extract/translate",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    ),
+  wework: {
+    sendModes: () =>
+      request<ApiOk<WeworkSendModes>>("/admin/api/wework/send-modes"),
+    send: (chat_id: string, content: string, to_external_userid?: string) =>
+      request<WeworkSendResponse>("/admin/api/wework/send", {
+        method: "POST",
+        body: JSON.stringify({ chat_id, content, to_external_userid }),
+      }),
+  },
+};

@@ -1,0 +1,159 @@
+import { Outlet, useLocation, useNavigate } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { useAuth } from "../auth";
+import { Menu, Button, Dropdown } from "antd";
+import {
+  BarChartOutlined,
+  FormOutlined,
+  IdcardOutlined,
+  LogoutOutlined,
+  MailOutlined,
+  ScheduleOutlined,
+  SendOutlined,
+  SettingOutlined,
+  UserOutlined,
+} from "@ant-design/icons";
+
+const TITLES: Record<string, string> = {
+  "/": "运营统计",
+  "/sessions": "会话材料",
+  "/register": "快速注册",
+  "/id-extract": "证件识别",
+  "/wework-send": "外部群发消息",
+  "/jobs": "注册任务",
+  "/email-config": "邮箱配置",
+  "/default-office": "注册配置",
+  "/quality": "回答质量",
+};
+
+type NavGroup = {
+  label: string;
+  items: { to: string; label: string; icon: React.ReactNode }[];
+};
+
+const NAV_GROUPS: NavGroup[] = [
+  {
+    label: "运营",
+    items: [
+      { to: "/", label: "运营统计", icon: <BarChartOutlined /> },
+      // { to: "/sessions", label: "会话材料", icon: <TeamOutlined /> },
+      { to: "/jobs", label: "注册任务", icon: <ScheduleOutlined /> },
+      // { to: "/quality", label: "回答质量", icon: <BarChartOutlined /> },
+    ],
+  },
+  {
+    label: "工具",
+    items: [
+      { to: "/id-extract", label: "证件识别", icon: <IdcardOutlined /> },
+      { to: "/register", label: "快速注册", icon: <FormOutlined /> },
+      { to: "/wework-send", label: "外部群发消息", icon: <SendOutlined /> },
+    ],
+  },
+  {
+    label: "系统",
+    items: [
+      { to: "/email-config", label: "邮箱配置", icon: <MailOutlined /> },
+      { to: "/default-office", label: "注册配置", icon: <SettingOutlined /> },
+    ],
+  },
+];
+
+export function Layout() {
+  const loc = useLocation();
+  const nav = useNavigate();
+  const { user, logout } = useAuth();
+  const base = loc.pathname.replace(/\/$/, "") || "/";
+  const title =
+    TITLES[base] ||
+    (base.startsWith("/sessions/")
+      ? "会话详情"
+      : base.startsWith("/jobs/")
+        ? "任务详情"
+        : "管理后台");
+
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    setTick((t) => t + 1);
+  }, [loc.pathname, loc.search]);
+
+  async function onLogout() {
+    await logout();
+    nav("/login", { replace: true });
+  }
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <img className="brand-logo" src="/admin/logo.png" alt="赢态" width={40} height={40} />
+          <div>
+            <div className="brand-name">赢态 Finance AI</div>
+            <div className="brand-sub">运营管理后台</div>
+          </div>
+        </div>
+        <nav className="nav">
+          <Menu
+            mode="inline"
+            selectedKeys={[base]}
+            items={NAV_GROUPS.map((g) => ({
+              key: g.label,
+              label: g.label,
+              type: "group" as const,
+              children: g.items.map((it) => ({
+                key: it.to,
+                icon: it.icon,
+                label: it.label,
+              })),
+            }))}
+            onClick={({ key }) => nav(key)}
+            inlineIndent={12}
+            style={{ border: "none", background: "transparent", fontSize: 13 }}
+            theme="dark"
+          />
+        </nav>
+      </aside>
+      <div className="main">
+        <header className="topbar">
+          <div>
+            <h1>{title}</h1>
+          </div>
+          <div className="topbar-actions">
+            <Dropdown
+              trigger={["hover"]}
+              placement="bottomRight"
+              menu={{
+                items: [
+                  {
+                    key: "user",
+                    label: user || "未登录",
+                    disabled: true,
+                  },
+                  { type: "divider" },
+                  {
+                    key: "logout",
+                    label: "退出",
+                    icon: <LogoutOutlined />,
+                    danger: true,
+                  },
+                ],
+                onClick: ({ key }) => {
+                  if (key === "logout") void onLogout();
+                },
+              }}
+            >
+              <Button
+                type="text"
+                className="topbar-user"
+                icon={<UserOutlined />}
+                aria-label="用户菜单"
+              />
+            </Dropdown>
+          </div>
+        </header>
+        <main className="content" key={tick}>
+          <Outlet />
+        </main>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,7194 @@
+"""ICRIS 账号注册浏览器自动化（不提交）"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import secrets
+import string
+import time
+import unicodedata
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import Any, TYPE_CHECKING
+from urllib.parse import parse_qsl, urlencode, urlparse
+
+from config.settings import settings
+from src.browser.icris_captcha import fill_captcha as fill_icris_captcha
+from src.browser.icris_errors import (
+    IcrisFlowError,
+    IcrisLoadingTimeoutError,
+    IcrisRestartFromS01,
+    IcrisStepLoadError,
+    is_icris_format_invalid_error,
+    is_icris_username_taken_error,
+    is_id_already_registered_error,
+    register_loading_timeout_message,
+)
+from src.browser.icris_ui_common import (
+    ICRIS_PAGE_IS_LOADING_JS,
+    dismiss_google_translate,
+    is_page_loading,
+)
+from src.browser.launcher import create_browser_context, launch_browser
+from src.llm.openai_client import LLMClient
+from src.materials.id_type_classify import (
+    normalize_stored_id_type,
+    s03_id_type_select_pattern,
+    s04_identity_fill_values,
+)
+from src.materials.address_classify import (
+    clip_icris_addr,
+    s03_address_fields_for_fill,
+    stored_s03_address_fields,
+)
+
+if TYPE_CHECKING:
+    from playwright.async_api import BrowserContext, Page
+
+logger = logging.getLogger(__name__)
+
+_PAGE_PAUSE_MS = 80
+_POLL_MS = 100
+_FORM_PAUSE_MS = 120
+_SPIN_TIMEOUT_MS = 45000
+_STEP_READY_MS = 30000
+# s02/s03/s04/s03a 底栏「继 续 / 繼 續」（字间空格）
+CONTINUE_BTN_RE = re.compile(r"继\s*续|繼\s*續|Continue|Next|下一步", re.I)
+_S04_LOCATOR_MS = 3000
+_S04_RADIO_WAIT_MS = 20000
+_S04_RADIO_LABEL_MAX = 200
+
+REGISTRATION_BASE = (
+    "https://www.e-services.cr.gov.hk/ICRIS3EF/system/registration/s01.do"
+)
+PORTAL_URL = "https://www.e-services.cr.gov.hk/"
+
+
+def build_registration_url(systemclock: str | int | None = None) -> str:
+    """
+    构建注册 URL。systemclock 必须来自门户会话，自行伪造会被重定向到 cr.gov.hk 首页。
+    """
+    clock = str(systemclock or int(time.time() * 1000))
+    return (
+        f"{REGISTRATION_BASE}"
+        f"?systemclock={clock}&webEnv=PROD&isOnsite=false&inactiveTime=0"
+    )
+
+
+def append_random_username_suffix(username: str, length: int = 2) -> str:
+    """在用户名末尾追加随机字母数字，避免 mock 注册时用户名重复"""
+    base = (username or "").strip()
+    if not base or length <= 0:
+        return base
+    alphabet = string.ascii_lowercase + string.digits
+    suffix = "".join(secrets.choice(alphabet) for _ in range(length))
+    return f"{base}{suffix}"
+
+
+def _person_en_and_id_from_data(data: dict[str, Any]) -> tuple[str, str]:
+    """从 company_data 提取用户名用英文/拼音与证件号。不写回 name_en。"""
+    applicant = data.get("applicant") or {}
+    identity = data.get("identity_proof") or {}
+    directors = data.get("directors") or []
+    founders = data.get("founder_members") or []
+    director0 = directors[0] if directors and isinstance(directors[0], dict) else {}
+    founder0 = founders[0] if founders and isinstance(founders[0], dict) else {}
+
+    person_en = (
+        str(applicant.get("name_en") or "").strip()
+        or str(director0.get("name_en") or "").strip()
+        or str(founder0.get("name_en") or "").strip()
+    )
+    person_cn = (
+        str(applicant.get("name_cn") or "").strip()
+        or str(director0.get("name_cn") or "").strip()
+        or str(founder0.get("name_cn") or "").strip()
+    )
+    from src.materials.aggregator import person_en_for_icris_username
+
+    person_en = person_en_for_icris_username(person_en, person_cn)
+    id_number = (
+        str(identity.get("id_number") or "").strip()
+        or str(applicant.get("id_number") or "").strip()
+        or str(director0.get("id_number") or "").strip()
+        or str(founder0.get("id_number") or "").strip()
+    )
+    return person_en, id_number
+
+
+def _is_legacy_yingtai_username(username: str) -> bool:
+    """旧规则用户名：Yingtai + 月日/随机（非 initials+证件+yt）。"""
+    u = (username or "").strip()
+    if not u:
+        return False
+    prefix = (getattr(settings, "icris_username_prefix", "Yingtai") or "Yingtai").strip()
+    if not prefix:
+        return False
+    return u.startswith(prefix) or u.lower().startswith(prefix.lower())
+
+
+def _s02_password_meets_rules(password: str) -> bool:
+    """ICRIS s02：≥10 位，含数字、大写、小写。"""
+    pwd = password or ""
+    return (
+        len(pwd) >= 10
+        and any(c.isdigit() for c in pwd)
+        and any(c.isupper() for c in pwd)
+        and any(c.islower() for c in pwd)
+    )
+
+
+def _normalize_s02_username(username: str, person_en: str = "") -> str:
+    """s02 用户名：仅首字母大写（与密码规范化方式一致），其余字符保持原样。"""
+    u = (username or "").strip()
+    if not u:
+        return u
+    return u[0].upper() + u[1:]
+
+
+def _s02_username_need_fix(username: str) -> bool:
+    u = (username or "").strip()
+    if not u:
+        return False
+    return u != u[0].upper() + u[1:]
+
+
+def _ensure_s02_password(username: str, suffix: str = "@") -> str:
+    """s02 密码：优先 username+suffix；不合规则首字母大写化或追加 Yt1。"""
+    suffix = suffix or "@"
+    pwd = f"{username}{suffix}"
+    if _s02_password_meets_rules(pwd):
+        return pwd
+    if username:
+        pwd = f"{username[0].upper()}{username[1:]}{suffix}"
+        if _s02_password_meets_rules(pwd):
+            return pwd
+    return f"{username}Yt1{suffix}"
+
+
+def finalize_s02_icris_credentials(
+    data: dict[str, Any],
+    username: str,
+    password: str = "",
+) -> tuple[str, str]:
+    """s02 专用：规范化用户名首字母与密码，写回 icris_account / _icris_session。"""
+    person_en, _ = _person_en_and_id_from_data(data)
+    username = _normalize_s02_username(username, person_en)
+    pw_suffix = getattr(settings, "icris_password_suffix", "@") or "@"
+    password = _ensure_s02_password(username, pw_suffix)
+    acct = data.get("icris_account")
+    if not isinstance(acct, dict):
+        acct = {}
+        data["icris_account"] = acct
+    acct["username"] = username
+    acct["password"] = password
+    session = data.setdefault("_icris_session", {})
+    session["username"] = username
+    session["password"] = password
+    return username, password
+
+
+def derive_icris_credentials(data: dict[str, Any]) -> tuple[str, str]:
+    """从 company_data 生成 ICRIS 用户名与密码（同一次流程保持一致）。
+
+    yingtai 模式：英文名首字母 + 证件后5位 + yt + 4位随机，密码 = 用户名 + @。
+    旧 Yingtai 前缀或无随机后缀的 initials+yt 凭证会按新规则重算。
+    """
+    session = data.setdefault("_icris_session", {})
+    if session.get("username") and session.get("password"):
+        return session["username"], session["password"]
+
+    acct = data.get("icris_account") or {}
+    if not isinstance(acct, dict):
+        acct = {}
+        data["icris_account"] = acct
+    applicant = data.get("applicant") or {}
+    if not isinstance(applicant, dict):
+        applicant = {}
+
+    username = (acct.get("username") or "").strip()
+    password_raw = (acct.get("password") or "").strip()
+    person_en, id_number = _person_en_and_id_from_data(data)
+    mode = getattr(settings, "icris_credential_mode", "yingtai")
+
+    # yingtai：按 initials+id+yt 生成（含重算旧 Yingtai 前缀）
+    if mode == "yingtai":
+        from src.materials.aggregator import (
+            _generate_icris_credentials,
+            _yingtai_username_has_random_suffix,
+        )
+
+        need_regen = (
+            not username
+            or (
+                _is_legacy_yingtai_username(username) and bool(person_en or id_number)
+            )
+            or (bool(username) and not _yingtai_username_has_random_suffix(username))
+            or _s02_username_need_fix(username)
+            or (
+                bool(password_raw)
+                and username
+                and not _s02_password_meets_rules(password_raw)
+            )
+        )
+        if need_regen:
+            username, password = _generate_icris_credentials(
+                person_en=person_en, id_number=id_number
+            )
+            username, password = finalize_s02_icris_credentials(
+                data, username, password
+            )
+            logger.info(
+                "ICRIS 凭证已生成 (initials+id+yt+rand): user=%s person=%s id_tail=%s",
+                username,
+                person_en[:40],
+                re.sub(r"[^A-Za-z0-9]", "", id_number)[-5:],
+            )
+            return username, password
+
+        # 预生成凭证：s02 规范化（首字母小写 + 密码合规）
+        if username and password_raw and _yingtai_username_has_random_suffix(username):
+            return finalize_s02_icris_credentials(data, username, password_raw)
+
+    # 预生成 username+password（非 yingtai 或未触发重算）→ 原样使用
+    if username and password_raw:
+        session["username"] = username
+        session["password"] = password_raw
+        return username, password_raw
+
+    # legacy：邮箱用户名 + 随机后缀 + 姓名派生密码
+    if not username:
+        email = applicant.get("email", "")
+        if "@" in email:
+            username = email.split("@", 1)[0]
+        else:
+            parts = re.sub(r"[^A-Za-z0-9]", "", applicant.get("name_en", "user"))
+            username = parts.lower() or "icrisuser"
+
+    username = append_random_username_suffix(username, length=2)
+    password = ensure_icris_password(password_raw or data.get("password_hint", ""))
+    session["username"] = username
+    session["password"] = password
+    return username, password
+
+
+def split_applicant_english_name(name_en: str) -> tuple[str, str]:
+    """英文姓名 → (名, 姓)，如 CHAN Tai Man → (Tai Man, CHAN)"""
+    parts = [p for p in (name_en or "").split() if p]
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], parts[0]
+    return " ".join(parts[1:]), parts[0]
+
+
+def latin_english_given_surname(name_en: str, name_cn: str = "") -> tuple[str, str]:
+    """有中文名则不填英文姓/名；仅无中文且含拉丁字母时拆英文名。"""
+    if re.search(r"[\u4e00-\u9fff]", str(name_cn or "")):
+        return "", ""
+    text = (name_en or "").strip()
+    if not re.search(r"[A-Za-z]", text):
+        return "", ""
+    return split_applicant_english_name(text)
+
+
+def s03_skip_english_name(
+    raw_director_name: str = "",
+    name_cn: str = "",
+    name_en: str = "",
+) -> bool:
+    """原文有汉字且无拉丁字母时不填英文姓/名（忽略 name_en 里的拼音）。"""
+    src = (raw_director_name or "").strip()
+    cn = "".join(
+        ch for ch in str(name_cn or "") if "\u4e00" <= ch <= "\u9fff"
+    )
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", src) or cn)
+    latin_in_raw = bool(re.search(r"[A-Za-z]", src))
+    if has_cjk and not latin_in_raw:
+        return True
+    if src:
+        return False
+    blob = f"{name_cn or ''} {name_en or ''}"
+    return bool(re.search(r"[\u4e00-\u9fff]", blob)) and not bool(
+        re.search(r"[A-Za-z]", blob)
+    )
+
+
+def _admin_job_review_url(job_id: int, admin_public_url: str) -> str:
+    base = (admin_public_url or "").strip().rstrip("/")
+    if not base:
+        return ""
+    low = base.lower()
+    if "127.0.0.1" in low or "localhost" in low:
+        return ""
+    return f"{base}/jobs/{int(job_id)}"
+
+
+def format_s03a_review_message(
+    job_id: int,
+    data: dict[str, Any] | None = None,
+    *,
+    admin_public_url: str | None = None,
+    s03a_duration: str = "",
+) -> str:
+    """s03a 审核 webhook 正文（企微 markdown）。空字段跳过。不含后台链接。"""
+    _ = admin_public_url  # 保留兼容；企微内置浏览器打开，组文不再带链接
+    payload = data if isinstance(data, dict) else {}
+    applicant = payload.get("applicant") or {}
+    if not isinstance(applicant, dict):
+        applicant = {}
+    contact = payload.get("contact") or {}
+    if not isinstance(contact, dict):
+        contact = {}
+    acct = payload.get("icris_account") or {}
+    if not isinstance(acct, dict):
+        acct = {}
+
+    cn = str(payload.get("company_name_cn") or "").strip()
+    en = str(payload.get("company_name_en") or "").strip()
+    company = " / ".join(p for p in (cn, en) if p)
+
+    name_cn = str(applicant.get("name_cn") or "").strip()
+    name_en = str(applicant.get("name_en") or "").strip()
+    person = name_cn or name_en
+
+    id_type = str(applicant.get("id_type") or "").strip()
+    id_number = str(applicant.get("id_number") or "").strip()
+    id_line = "  ".join(p for p in (id_type, id_number) if p)
+
+    username = str(acct.get("username") or "").strip()
+    password = str(acct.get("password") or "").strip()
+    account = " / ".join(p for p in (username, password) if p)
+
+    email = (
+        str(contact.get("email") or "").strip()
+        or str(applicant.get("email") or "").strip()
+    )
+
+    duration = str(s03a_duration or "").strip()
+
+    lines = [
+        f"【ICRIS 注册审核】任务 #{job_id}",
+        "请到管理后台核对后点「提交」或「拒绝」",
+    ]
+    if duration:
+        lines.append(f"耗时：{duration}")
+    if company:
+        lines.append(f"公司：{company}")
+    if person:
+        lines.append(f"申请人：{person}")
+    if id_line:
+        lines.append(f"证件：{id_line}")
+    if account:
+        lines.append(f"账号：{account}")
+    if email:
+        lines.append(f"邮箱：{email}")
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3990] + "…"
+    return text
+
+
+def derive_mock_china_address(applicant: dict[str, Any]) -> dict[str, str]:
+    """非香港地址（中国大陆）mock 数据"""
+    cn = applicant.get("address_cn")
+    if isinstance(cn, dict):
+        return {
+            "room": str(cn.get("room", "8楼A室")),
+            "building": str(cn.get("building", "幸福大厦")),
+            "street": str(cn.get("street", "科技园南路1号")),
+            "region": str(cn.get("region", "广东省深圳市南山区 518000")),
+        }
+    return {
+        "room": "8楼A室",
+        "building": "快乐大厦",
+        "street": "中关村大街1号",
+        "region": "广东省广州市天河区 510000",
+    }
+
+
+def split_cjk_latin_name(name: str) -> tuple[str, str]:
+    """姓名 → (中文部分, 英文部分)。
+
+    纯中文→(name,"")；纯英文→("",name)；混合→(CJK片段, 拉丁片段)。
+    仅汉字进中文；ASCII 与全角逗号进英文，避免「，」写进中文姓名。
+    """
+    name = (name or "").strip()
+    if not name:
+        return "", ""
+    cjk_chars: list[str] = []
+    latin_chars: list[str] = []
+    for c in name:
+        if "\u4e00" <= c <= "\u9fff" or c in "·•、・":
+            cjk_chars.append(c)
+        elif c.isascii():
+            latin_chars.append(c)
+        elif c in "，":
+            latin_chars.append(",")
+    return "".join(cjk_chars).strip(), "".join(latin_chars).strip()
+
+
+def detect_hk_address(addr_en: str, addr_cn: str) -> bool:
+    """检测是否香港地址：含 香港/Hong Kong/Kowloon/九龍/新界/New Territories → True。"""
+    addr = ((addr_en or "") + " " + (addr_cn or "")).lower()
+    hk_keywords = (
+        "hong kong",
+        "kowloon",
+        "new territories",
+        "香港",
+        "九龍",
+        "九龙",
+        "新界",
+    )
+    return any(k in addr for k in hk_keywords)
+
+
+def split_address_street_region(address: str) -> tuple[str, str]:
+    """地址 → (街道, 区/市/省)。
+
+    含拉丁字母：按逗号分段，末 2 段→区/市/省，其余→街道（<3 段时末 1 段→区/市/省）。
+    纯中文：正则提取 省/自治区+市 为区/市/省，其余为街道；无省则取市。
+    兜底：全部归街道。
+    """
+    address = (address or "").strip()
+    if not address:
+        return "", ""
+    has_latin = any(c.isascii() and c.isalpha() for c in address)
+    if has_latin:
+        parts = [p.strip() for p in re.split(r"[,，]", address) if p.strip()]
+        if len(parts) >= 3:
+            region = ", ".join(parts[-2:])
+            street = ", ".join(parts[:-2])
+        elif len(parts) == 2:
+            region = parts[-1]
+            street = parts[0]
+        elif parts:
+            region = parts[-1]
+            street = ""
+        else:
+            region = ""
+            street = ""
+        return street, region
+    # 纯中文：省/自治区 + 市 为区/市/省，其余为街道
+    m = re.search(r"^((?:.*?省)|(?:.*?自治区))?(.*?市)(.*)$", address)
+    if m:
+        province = m.group(1) or ""
+        city = m.group(2) or ""
+        street = m.group(3) or ""
+        region = (province + city).strip()
+        return street.strip(), region
+    return address, ""
+
+
+def ensure_icris_password(raw: str) -> str:
+    """
+    ICRIS 密码规则：10 位以上，首字母大写，同时包含字母和数字。
+    """
+    default = "Chan2026Pass"
+    candidate = (raw or "").strip()
+    if _password_meets_rules(candidate):
+        return candidate
+
+    # 从申请人姓名派生，如 CHAN Tai Man -> Chan2026Man
+    if candidate:
+        letters = "".join(c for c in candidate if c.isalpha())[:6]
+        if letters:
+            derived = letters[0].upper() + letters[1:].lower() + "2026Pass"
+            if _password_meets_rules(derived):
+                return derived
+
+    return default
+
+
+def _password_meets_rules(password: str) -> bool:
+    return (
+        len(password) >= 10
+        and password[0].isupper()
+        and any(c.isalpha() for c in password)
+        and any(c.isdigit() for c in password)
+    )
+
+
+class IcrisRegistrationBot:
+    """ICRIS 电子服务账号注册 - 自动填写；仅显式开关下才点最终提交"""
+
+    def __init__(self, llm: LLMClient | None = None) -> None:
+        self.llm = llm or LLMClient()
+        self.dry_run = settings.dry_run
+        # 双重开关：DRY_RUN=false 且 ICRIS_ALLOW_SUBMIT=true 才允许最终提交
+        self.allow_submit = (not settings.dry_run) and bool(settings.icris_allow_submit)
+        self._locale: str | None = None
+        self._user_info_filled: bool = False
+        self._identity_proof_filled: bool = False
+        self._s03a_handled: bool = False
+        # s03a 截图路径（进入 s03a 时自动截图存档）
+        self.esubmit_screenshot_path: str = ""
+        # s05 成功页截图路径（提交成功后自动截图存档）
+        self.success_screenshot_path: str = ""
+        # 页面报错截图（写入 job screenshot_path，避免失败时再截刷新后的白页）
+        self.error_screenshot_path: str = ""
+        self._registration_rerun: bool = False
+        # 人工审核：job_id 和通知回调（allow_submit=True 时 s03a 等待审核）
+        self.job_id: int = 0
+        self.on_review_needed: Any = None  # Callable[[int, str], None] | None
+        self._company_data: dict[str, Any] = {}
+        self._active_page: "Page | None" = None
+
+    def _persist_s02_account_to_job(self, data: dict[str, Any]) -> None:
+        """s02 填表后将最终 icris_account 写回 job payload（供真实 NNC1 登录）。"""
+        if not self.job_id:
+            return
+        acct = data.get("icris_account") or {}
+        username = str(acct.get("username") or "").strip()
+        password = str(acct.get("password") or "").strip()
+        if not username or not password:
+            return
+        try:
+            from src.storage.db import ExternalGroupStore
+
+            ExternalGroupStore().update_job_payload_account(
+                self.job_id, username, password
+            )
+            logger.info(
+                "s02 凭证已写回 job payload #%s: user=%s", self.job_id, username
+            )
+        except Exception as exc:
+            logger.warning("s02 凭证写回 job payload 失败: %s", exc)
+
+    def _reset_flow_flags(self) -> None:
+        """关页重开前重置步骤内存标志，避免假成功。"""
+        self._user_info_filled = False
+        self._identity_proof_filled = False
+        self._s03a_handled = False
+        self._locale = None
+
+    def _job_is_cancelled(self) -> bool:
+        if not self.job_id:
+            return False
+        try:
+            from src.storage.db import ExternalGroupStore
+
+            return ExternalGroupStore().get_job_status(self.job_id) == "cancelled"
+        except Exception:
+            return False
+
+    def _job_is_rejected(self) -> bool:
+        if not self.job_id:
+            return False
+        try:
+            from src.storage.db import ExternalGroupStore
+
+            return ExternalGroupStore().get_job_review_status(self.job_id) == "rejected"
+        except Exception:
+            return False
+
+    def _job_abort_reason(self) -> str:
+        """取消或审核拒绝时返回原因，否则空串。"""
+        if self._job_is_cancelled():
+            return "任务已取消"
+        if self._job_is_rejected():
+            return "审核已拒绝"
+        return ""
+
+    def _raise_if_cancelled(self) -> None:
+        if self._job_is_cancelled():
+            raise IcrisFlowError("任务已被取消", no_requeue=True)
+
+    def _shutdown_job_chrome(self, reason: str) -> None:
+        """立刻杀掉整套 CDP Chrome（须在持锁线程调用）。"""
+        logger.warning("%s，关闭整窗 Chrome job #%s", reason, self.job_id)
+        try:
+            from src.browser.launcher import shutdown_cdp_chrome
+
+            shutdown_cdp_chrome()
+        except Exception:
+            logger.debug("结束 CDP Chrome 失败", exc_info=True)
+
+    async def _abort_page_if_cancelled(self) -> None:
+        """管理员取消或拒绝后立刻关掉整套 CDP Chrome，打断 Playwright 等待。"""
+        while True:
+            reason = self._job_abort_reason()
+            if reason:
+                self._shutdown_job_chrome(reason)
+                return
+            await asyncio.sleep(1.0)
+
+    async def _log_page(self, page: "Page", label: str) -> None:
+        logger.info("[%s] URL: %s", label, page.url)
+
+    async def _save_esubmit_screenshot(self, page: "Page") -> None:
+        """进入 s03a 后等待页面渲染完成再截图整个页面存档。"""
+        try:
+            from config.settings import PROJECT_ROOT
+            from datetime import datetime, timezone
+
+            # 1) 等待全页 loading /「载入中」遮罩消失
+            await self._wait_spin_clear(page, timeout_ms=_STEP_READY_MS)
+            # 2) 等待条款文案与 checkbox 渲染就绪（Vue 挂载完成）
+            try:
+                await self._wait_step_ready(
+                    page,
+                    self._esubmit_terms_is_ready,
+                    timeout_ms=_STEP_READY_MS,
+                    label="s03a 截图前",
+                )
+            except Exception:
+                pass
+            # 3) 关掉 Cookie 横幅，避免挡住用户信息
+            await self._dismiss_cookie_banner(page)
+            await page.wait_for_timeout(_PAGE_PAUSE_MS)
+
+            shot_dir = PROJECT_ROOT / "data" / "icris_esubmit"
+            shot_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            shot_file = shot_dir / f"job_esubmit_{stamp}.png"
+            if not page.is_closed():
+                await page.screenshot(path=str(shot_file), full_page=True)
+                self.esubmit_screenshot_path = str(shot_file)
+                logger.info("s03a 截图已保存: %s", self.esubmit_screenshot_path)
+                # 截图后立即写入 DB，供后台在审核期间展示核对图
+                if self.job_id:
+                    try:
+                        from src.storage.db import ExternalGroupStore
+
+                        store = ExternalGroupStore()
+                        store.update_job_esubmit_screenshot(
+                            self.job_id, self.esubmit_screenshot_path
+                        )
+                        store.set_job_s03a_duration(self.job_id)
+                    except Exception as db_err:
+                        logger.warning("写入 esubmit_screenshot_path 到 DB 失败: %s", db_err)
+        except Exception as shot_err:
+            logger.warning("保存 s03a 截图失败: %s", shot_err)
+
+    async def _save_success_screenshot(self, page: "Page") -> None:
+        """进入 s05 后等 loading 结束再截图整页存档（不依赖成功文案）。"""
+        try:
+            from config.settings import PROJECT_ROOT
+            from datetime import datetime, timezone
+
+            # 短等 loading 出现，再等到遮罩消失（避免 Vue 尚未挂载就当「没有 spinner」）
+            for _ in range(10):
+                if await self._is_spinning(page):
+                    break
+                await page.wait_for_timeout(100)
+            await self._wait_spin_clear(page, timeout_ms=_STEP_READY_MS)
+            await self._dismiss_cookie_banner(page)
+            await page.wait_for_timeout(300)
+
+            shot_dir = PROJECT_ROOT / "data" / "icris_success"
+            shot_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            shot_file = shot_dir / f"job_success_{stamp}.png"
+            if not page.is_closed():
+                await page.screenshot(path=str(shot_file), full_page=True)
+                self.success_screenshot_path = str(shot_file)
+                logger.info("s05 成功截图已保存: %s", self.success_screenshot_path)
+        except Exception as shot_err:
+            logger.warning("保存 s05 成功截图失败: %s", shot_err)
+
+    async def _save_error_screenshot(self, page: "Page") -> str:
+        """页面报错时立刻整页截图，写入 error_screenshot_path。"""
+        try:
+            from config.settings import PROJECT_ROOT
+            from datetime import datetime, timezone
+
+            if page.is_closed():
+                return self.error_screenshot_path or ""
+            shot_dir = PROJECT_ROOT / "data" / "icris_failures"
+            shot_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            shot_file = shot_dir / f"job_fail_{stamp}.png"
+            await page.screenshot(path=str(shot_file), full_page=True)
+            path = str(shot_file)
+            self.error_screenshot_path = path
+            logger.error("页面报错截图: %s", path)
+            return path
+        except Exception as shot_err:
+            logger.warning("页面报错截图失败: %s", shot_err)
+            return self.error_screenshot_path or ""
+
+    async def _save_s03a_continue_error_screenshot(self, page: "Page") -> str:
+        return await self._save_error_screenshot(page)
+
+    async def _wait_for_review_approval(self, page: "Page") -> bool:
+        """s03a 截图后等待人工审核确认（allow_submit=True 时调用）。
+
+        1. 标记 job 为 awaiting_review
+        2. 通过回调通知审核人
+        3. 轮询 DB review_status（每 5s，超时 30 分钟）
+        Returns: True=已批准, False=拒绝/超时
+        """
+        if not self.job_id:
+            logger.warning("s03a 无 job_id，跳过审核等待直接提交")
+            return True
+
+        from src.storage.db import ExternalGroupStore
+
+        store = ExternalGroupStore()
+        self._raise_if_cancelled()
+
+        existing_review = store.get_job_review_status(self.job_id)
+        if existing_review == "approved":
+            logger.info("s03a job #%s 已审核通过，跳过重复等待", self.job_id)
+            return True
+        if existing_review == "rejected":
+            logger.warning("s03a job #%s 已审核拒绝，停止等待", self.job_id)
+            return False
+
+        # 1) 标记 awaiting_review
+        store.mark_job_awaiting_review(self.job_id)
+        if store.get_job_status(self.job_id) != "awaiting_review":
+            self._raise_if_cancelled()
+            logger.warning(
+                "s03a job #%s 未能进入 awaiting_review（status=%s）",
+                self.job_id,
+                store.get_job_status(self.job_id),
+            )
+            return False
+        logger.info(
+            "s03a job #%s 已标记 awaiting_review，等待人工确认",
+            self.job_id,
+        )
+
+        # 2) 通知审核人
+        if self.on_review_needed:
+            try:
+                job = store.get_registration_job(self.job_id) or {}
+                duration = str(job.get("s03a_duration") or "").strip()
+                msg = format_s03a_review_message(
+                    self.job_id, self._company_data, s03a_duration=duration
+                )
+                self.on_review_needed(self.job_id, msg)
+            except Exception as e:
+                logger.warning("s03a 审核通知发送失败: %s", e)
+
+        # 3) 轮询等待
+        timeout_s = max(60, int(settings.icris_review_timeout_seconds or 1800))
+        poll_interval = 5.0
+        elapsed = 0.0
+        while elapsed < timeout_s:
+            self._raise_if_cancelled()
+            status = store.get_job_review_status(self.job_id)
+            if status == "rejected":
+                logger.warning("s03a 审核已拒绝 job #%s", self.job_id)
+                return False
+            if status == "approved":
+                logger.info(
+                    "s03a 审核已通过 job #%s（等待 %.0fs）",
+                    self.job_id,
+                    elapsed,
+                )
+                return True
+            try:
+                await page.wait_for_timeout(int(poll_interval * 1000))
+            except Exception:
+                self._raise_if_cancelled()
+                if store.get_job_review_status(self.job_id) == "rejected":
+                    logger.warning(
+                        "s03a 审核已拒绝（等待中浏览器已关闭）job #%s",
+                        self.job_id,
+                    )
+                    return False
+                raise
+            elapsed += poll_interval
+            job_status = store.get_job_status(self.job_id)
+            if job_status == "cancelled":
+                logger.warning("s03a 任务被取消 job #%s", self.job_id)
+                raise IcrisFlowError(
+                    "任务已被取消",
+                    screenshot_path=self.esubmit_screenshot_path or "",
+                    no_requeue=True,
+                )
+            status = store.get_job_review_status(self.job_id)
+            if status == "approved":
+                logger.info(
+                    "s03a 审核已通过 job #%s（等待 %.0fs）",
+                    self.job_id,
+                    elapsed,
+                )
+                return True
+            if status == "rejected":
+                logger.warning("s03a 审核已拒绝 job #%s", self.job_id)
+                return False
+            if int(elapsed) % 60 == 0:
+                logger.info(
+                    "s03a 仍在等待审核 job #%s（%.0f/%ds）",
+                    self.job_id,
+                    elapsed,
+                    timeout_s,
+                )
+
+        logger.error(
+            "s03a 审核超时 job #%s（%ds）",
+            self.job_id,
+            timeout_s,
+        )
+        return False
+
+    async def _is_spinning(self, page: "Page") -> bool:
+        """全页 ant-spin 或「载入中」遮罩。求值失败时当仍在加载。"""
+        return await is_page_loading(page)
+
+    def _nav_step_label(self, expect_step: str | None = None, url: str = "") -> str:
+        """从 expect_step / 当前 URL 推断切步目标（s01–s04、s03a）。"""
+        text = str(expect_step or "").lower()
+        for key in ("s03a", "s05", "s01", "s02", "s04", "s03"):
+            if key in text:
+                return key
+        lower = (url or "").lower()
+        if re.search(r"registration/s01", lower):
+            return "s02"
+        if re.search(r"registration/s02", lower):
+            return "s03"
+        if re.search(r"registration/s03a", lower):
+            return "s03a"
+        if re.search(r"registration/s03", lower):
+            return "s04"
+        if re.search(r"registration/s04", lower):
+            return "s03a"
+        return (expect_step or "").strip() or "页面"
+
+    async def _raise_if_nav_loading_timeout(
+        self, page: "Page", *, step: str
+    ) -> None:
+        if await self._is_spinning(page):
+            raise IcrisLoadingTimeoutError(register_loading_timeout_message(step))
+
+    async def _raise_if_missing_registration_step(
+        self, page: "Page", *, step: str, label: str
+    ) -> None:
+        await self._raise_if_nav_loading_timeout(page, step=step)
+        raise IcrisStepLoadError(f"未进入{label}: {page.url[:160]}")
+
+    async def _get_validation_errors(self, page: "Page") -> list[str]:
+        try:
+            errs = await page.evaluate(
+                """() => {
+                    const out = [];
+                    const skip = (el) => el.classList && (
+                        el.classList.contains('ant-alert-success')
+                        || el.classList.contains('ant-alert-info')
+                        || el.classList.contains('ant-message-success')
+                        || el.classList.contains('ant-message-loading')
+                    );
+                    for (const el of document.querySelectorAll(
+                        '.ant-form-item-explain-error, .ant-message-error, '
+                        + '.ant-alert-error, .ant-alert, [role=alert], '
+                        + '.ant-form-item-has-error, .has-error, .is-invalid'
+                    )) {
+                        if (skip(el)) continue;
+                        const t = (el.innerText || '').trim();
+                        if (t) out.push(t);
+                    }
+                    // 红色图标（圈叉/感叹号）同段文案，如弹层/通知里的报错
+                    for (const icon of document.querySelectorAll(
+                        '.anticon-close-circle, .anticon-exclamation-circle'
+                    )) {
+                        const host = icon.closest(
+                            '.ant-alert, [role=alert], .ant-form-item, '
+                            + '.ant-message-notice, .ant-notification-notice, '
+                            + 'div, td, span'
+                        );
+                        const t = (host && host.innerText || '').trim();
+                        if (t) out.push(t);
+                    }
+                    return [...new Set(out)].slice(0, 8);
+                }"""
+            )
+            return errs or []
+        except Exception:
+            return []
+
+    async def _page_body_text(self, page: "Page") -> str:
+        try:
+            return str(
+                await page.evaluate(
+                    "() => (document.body && document.body.innerText) || ''"
+                )
+                or ""
+            )
+        except Exception:
+            return ""
+
+    async def _raise_if_id_already_registered(
+        self, page: "Page", errs: list[str] | None = None
+    ) -> None:
+        """仅当 s04 出现「相同的身分證件號碼已在系統中登記」才失败。"""
+        texts = list(errs or [])
+        if not is_id_already_registered_error(texts):
+            body = await self._page_body_text(page)
+            if is_id_already_registered_error(body):
+                texts = ["相同的身分證件號碼已在系統中登記！"]
+            elif not texts:
+                texts = await self._get_validation_errors(page)
+        if not is_id_already_registered_error(texts):
+            return
+        logger.error("s04 证件号码已在系统登记: %s", texts[:4])
+        raise IcrisFlowError(
+            "相同的身分證件號碼已在系統中登記！",
+            no_requeue=True,
+            id_already_registered=True,
+        )
+
+    async def _raise_if_format_invalid(
+        self,
+        page: "Page",
+        errs: list[str] | None = None,
+        *,
+        step: str = "",
+    ) -> None:
+        """仅「格式不正确/不正確」。证件已登记须先走 _raise_if_id_already_registered。"""
+        texts = list(errs or [])
+        if not texts:
+            texts = await self._get_validation_errors(page)
+        if not is_icris_format_invalid_error(texts):
+            return
+        msg = next(
+            (t for t in texts if "格式不" in t.replace(" ", "")),
+            texts[0],
+        )
+        prefix = f"{step} " if step else ""
+        logger.error("%s格式不正确: %s", prefix, msg)
+        raise IcrisFlowError(f"{prefix}{msg}".strip(), no_requeue=True)
+
+    async def _raise_if_rerun_on_page_error(
+        self,
+        page: "Page",
+        errs: list[str] | None = None,
+        *,
+        step: str = "",
+    ) -> None:
+        """证件已登记/格式不正确/用户名占用走原逻辑；其余页面报错截图后关页重跑。"""
+        texts = list(errs or [])
+        if not texts:
+            texts = await self._get_validation_errors(page)
+        # 正文兜底：弹层/提示里的三类终态报错不一定在 ant-alert 里
+        body = await self._page_body_text(page)
+        probe = texts + ([body] if body else [])
+        await self._raise_if_id_already_registered(page, texts)
+        await self._raise_if_format_invalid(page, probe, step=step)
+        if is_icris_username_taken_error(probe):
+            return
+        if not texts:
+            return
+        err_text = next((t for t in texts if t), "页面报错")
+        prefix = f"{step} " if step else ""
+        logger.error("%s页面报错，关页重跑: %s", prefix, err_text)
+        path = await self._save_error_screenshot(page)
+        if path and not self.error_screenshot_path:
+            self.error_screenshot_path = path
+        raise IcrisRestartFromS01(
+            f"{prefix}{err_text}".strip(),
+            screenshot_path=self.error_screenshot_path or path or "",
+        )
+
+    def _regen_s02_username(self, data: dict[str, Any]) -> tuple[str, str]:
+        """用户名已占用：清 session 后按 retry 规则换随机后缀。"""
+        from src.materials.aggregator import _generate_icris_credentials
+
+        session = data.get("_icris_session")
+        if isinstance(session, dict):
+            session.pop("username", None)
+            session.pop("password", None)
+        person_en, id_number = _person_en_and_id_from_data(data)
+        if not id_number:
+            id_number = str(
+                (data.get("identity_proof") or {}).get("id_number") or ""
+            )
+        raw_user, raw_pwd = _generate_icris_credentials(
+            person_en, id_number, retry=True
+        )
+        username, password = finalize_s02_icris_credentials(
+            data, raw_user, raw_pwd
+        )
+        logger.info("s02 用户名已占用，已换新用户名: %s", username)
+        return username, password
+
+    async def _retry_s02_if_username_taken(
+        self, page: "Page", data: dict[str, Any]
+    ) -> bool:
+        """continue 失败且用户名占用：当场换随机后缀再填一次。仍占用则抛可重跑错误。"""
+        errs = await self._get_validation_errors(page)
+        if not is_icris_username_taken_error(errs):
+            return False
+        username, password = self._regen_s02_username(data)
+        await self._fill_s02_credentials_fields(page, username, password)
+        self._persist_s02_account_to_job(data)
+        if await self._click_account_profile_continue(page):
+            await self._log_page(page, "账户资料换用户名继续后")
+            return True
+        errs2 = await self._get_validation_errors(page)
+        if is_icris_username_taken_error(errs2):
+            msg = next((t for t in errs2 if t), "用户名称已存在")
+            raise IcrisFlowError(f"s02 {msg}")
+        return False
+
+    async def _wait_spin_clear(self, page: "Page", timeout_ms: int | None = None) -> bool:
+        """等待全页 loading /「载入中」结束。超时不当成已加载完；Esc 仅作恢复尝试。"""
+        self._raise_if_cancelled()
+        if page.is_closed():
+            return False
+        limit = timeout_ms or _SPIN_TIMEOUT_MS
+        if not await self._is_spinning(page):
+            return True
+        logger.info("等待页面 loading…")
+        try:
+            await page.wait_for_function(
+                f"() => !({ICRIS_PAGE_IS_LOADING_JS})",
+                timeout=limit,
+            )
+            return True
+        except Exception:
+            pass
+        if not await self._is_spinning(page):
+            return True
+        logger.warning("loading 超时 %dms，尝试 Esc 恢复", limit)
+        errors = await self._get_validation_errors(page)
+        if errors:
+            logger.warning("校验错误: %s", errors[:4])
+        for _ in range(2):
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(300)
+            except Exception:
+                pass
+            if not await self._is_spinning(page):
+                return True
+        still = await self._is_spinning(page)
+        if still:
+            logger.warning("loading 遮罩仍在，不继续填")
+        return not still
+
+    async def _wait_step_ready(
+        self,
+        page: "Page",
+        ready_fn: Callable[["Page"], Awaitable[bool]],
+        *,
+        timeout_ms: int = _STEP_READY_MS,
+        label: str = "",
+        abort_on_validation: bool = False,
+    ) -> bool:
+        """等待 spinner 消失且 ready_fn 为真。校验红字时可立刻停，避免吃满超时。"""
+        if page.is_closed():
+            return False
+        deadline = time.time() + max(0.5, timeout_ms / 1000)
+        tag = label or "步骤"
+        while time.time() < deadline:
+            self._raise_if_cancelled()
+            if page.is_closed():
+                return False
+            remain_ms = max(200, int((deadline - time.time()) * 1000))
+            await self._wait_spin_clear(page, timeout_ms=min(3000, remain_ms))
+            if await self._is_spinning(page):
+                if abort_on_validation:
+                    errs = await self._get_validation_errors(page)
+                    if errs:
+                        logger.warning("%s 表单校验失败，停止等待: %s", tag, errs[:4])
+                        return False
+                await page.wait_for_timeout(min(500, max(100, remain_ms)))
+                continue
+            try:
+                if await ready_fn(page):
+                    return True
+            except Exception:
+                logger.debug("%s ready_fn 检查异常", tag, exc_info=True)
+            if abort_on_validation:
+                errs = await self._get_validation_errors(page)
+                if errs:
+                    logger.warning("%s 表单校验失败，停止等待: %s", tag, errs[:4])
+                    return False
+            await page.wait_for_timeout(min(500, max(100, remain_ms)))
+        if await self._is_spinning(page):
+            return False
+        try:
+            return bool(await ready_fn(page))
+        except Exception:
+            return False
+
+    async def _recover_step_or_restart(
+        self,
+        page: "Page",
+        ready_fn: Callable[["Page"], Awaitable[bool]],
+        *,
+        label: str = "",
+    ) -> "Page":
+        """等 20s → reload 再等 20s；仍失败则抛 IcrisStepLoadError。"""
+        tag = label or "步骤"
+        if await self._wait_step_ready(
+            page, ready_fn, timeout_ms=_STEP_READY_MS, label=tag
+        ):
+            return page
+
+        errs = await self._get_validation_errors(page)
+        if errs:
+            logger.warning("%s 有校验错误，不刷新重等: %s", tag, errs[:4])
+            await self._raise_if_rerun_on_page_error(
+                page, errs, step=self._nav_step_label(tag)
+            )
+            raise IcrisStepLoadError(f"{tag} 表单校验失败: {errs[0][:80]}")
+
+        logger.warning("%s 未在 %dms 内就绪，刷新页面…", tag, _STEP_READY_MS)
+        try:
+            await page.reload(wait_until="commit", timeout=45000)
+            await self._wait_spin_clear(page, timeout_ms=_STEP_READY_MS)
+        except Exception as exc:
+            logger.warning("%s reload 失败: %s", tag, exc)
+
+        if await self._wait_step_ready(
+            page, ready_fn, timeout_ms=_STEP_READY_MS, label=tag
+        ):
+            logger.info("%s reload 后已就绪 url=%s", tag, page.url[:120])
+            return page
+
+        logger.error(
+            "%s reload 后仍未就绪 url=%s",
+            tag,
+            page.url[:120],
+        )
+        await self._raise_if_nav_loading_timeout(
+            page, step=self._nav_step_label(tag, page.url)
+        )
+        raise IcrisStepLoadError(f"{tag} 关键元素加载失败: {page.url[:160]}")
+
+    async def _reopen_fresh_page(
+        self, page: "Page", context: "BrowserContext"
+    ) -> "Page":
+        """关闭当前标签页并开新页（不关 Chrome/CDP）。"""
+        try:
+            if page is not None and not page.is_closed():
+                await page.close()
+        except Exception:
+            logger.debug("关闭旧页失败", exc_info=True)
+        new_page = await context.new_page()
+        self._active_page = new_page
+        logger.info("已关闭旧页并打开新标签，准备重新进入注册")
+        return new_page
+
+    async def _wait_registration_vue(self, page: "Page", timeout: int = 45000) -> bool:
+        """等待注册条款页 Vue 挂载（checkbox / 验证码 / 步骤文案）"""
+        await self._wait_spin_clear(page, timeout_ms=min(30000, timeout))
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const href = window.location.href;
+                    const body = document.body?.innerText || '';
+                    if (/\/registration\\/s0[1-9]/i.test(href)) {
+                        if (/验证码|驗證碼|条款|條款|接受|Accept|注册|註冊/i.test(body)) return true;
+                    }
+                    if (href.includes('#')) return true;
+                    if (document.querySelector(
+                        'input[type=checkbox], #checkCode, img[src^="data:image"]'
+                    )) return true;
+                    if (document.querySelector('.ant-form, #uam-content, .formSection')) {
+                        if (/registration|注册|註冊/i.test(body)) return true;
+                    }
+                    return Array.from(document.querySelectorAll('form')).some(
+                        (f) => /registration/i.test(f.getAttribute('action') || '')
+                    );
+                }""",
+                timeout=timeout,
+            )
+            await page.wait_for_timeout(_PAGE_PAUSE_MS)
+            return True
+        except Exception:
+            return False
+
+    async def _registration_page_probe(self, page: "Page") -> dict[str, Any]:
+        """诊断注册页 DOM 状态（Vue 检测失败时）"""
+        try:
+            return await page.evaluate(
+                """() => {
+                    const body = document.body?.innerText || '';
+                    return {
+                        href: window.location.href,
+                        spinning: !!document.querySelector('.ant-spin-spinning'),
+                        checkCode: !!document.querySelector('#checkCode'),
+                        checkbox: !!document.querySelector('input[type=checkbox]'),
+                        captchaImg: !!document.querySelector('img[src^="data:image"]'),
+                        formCount: document.querySelectorAll('form').length,
+                        bodySample: body.slice(0, 200),
+                    };
+                }"""
+            )
+        except Exception as e:
+            return {"error": str(e)}
+
+    async def _dump_page_diagnostics(self, page: "Page", label: str = "") -> None:
+        """输出完整页面诊断信息（反自动化排查用）"""
+        try:
+            diag = await page.evaluate(
+                """() => {
+                    const body = document.body;
+                    return {
+                        url: window.location.href,
+                        title: document.title,
+                        bodyLen: body ? body.innerHTML.length : 0,
+                        bodySample: body ? body.innerText.slice(0, 300) : '',
+                        hasVue: !!window.__vue_app__ || !!document.querySelector('[data-v-]'),
+                        cookies: document.cookie.slice(0, 200),
+                        scripts: Array.from(document.querySelectorAll('script[src]'))
+                            .map(s => s.src.slice(0, 80)).slice(0, 10),
+                        forms: document.querySelectorAll('form').length,
+                        inputs: document.querySelectorAll('input').length,
+                    };
+                }"""
+            )
+            logger.warning(
+                "[%s诊断] url=%s title=%s bodyLen=%d vue=%s forms=%d inputs=%d "
+                "body=%s cookies=%s scripts=%s",
+                label,
+                diag.get("url", "")[:120],
+                diag.get("title", "")[:40],
+                diag.get("bodyLen", 0),
+                diag.get("hasVue", False),
+                diag.get("forms", 0),
+                diag.get("inputs", 0),
+                diag.get("bodySample", "")[:150],
+                diag.get("cookies", "")[:100],
+                diag.get("scripts", [])[:5],
+            )
+        except Exception as e:
+            logger.debug("诊断信息获取失败: %s", e)
+
+    async def _registration_terms_ready(self, page: "Page") -> bool:
+        """条款页是否可交互（比 _registration_terms_visible 更宽松）"""
+        if await self._registration_terms_visible(page):
+            return True
+        if not self._is_registration_page(page.url):
+            return False
+        probe = await self._registration_page_probe(page)
+        if probe.get("checkCode") or probe.get("checkbox") or probe.get("captchaImg"):
+            return True
+        sample = probe.get("bodySample") or ""
+        return bool(re.search(r"验证码|驗證碼|条款|條款|接受|Accept", sample))
+
+    async def _wait_page_ready(self, page: "Page", timeout: int = 25000) -> None:
+        """
+        等待页面可操作。政府站点 pdf.mjs 会阻塞 domcontentloaded，
+        注册流程页改用 commit + 等待 Vue 条款表单。
+        """
+        try:
+            await page.wait_for_load_state("commit", timeout=5000)
+        except Exception:
+            pass
+
+        if self._is_registration_page(page.url):
+            if not await self._wait_registration_vue(page, timeout=timeout):
+                logger.warning("注册页业务元素未在 %dms 内出现", timeout)
+            return
+
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=min(15000, timeout))
+        except Exception:
+            logger.debug("domcontentloaded 超时，继续（政府站点常见）")
+        await self._wait_spin_clear(page, timeout_ms=min(20000, timeout))
+        await page.wait_for_timeout(_PAGE_PAUSE_MS)
+
+    async def _wait_portal_session(self, page: "Page", timeout_ms: int = 20000) -> bool:
+        """等待门户 home.do 就绪（替代固定轮询）
+
+        检测被重定向到 cr.gov.hk 公开站的情况，并输出诊断信息。
+        """
+        # 先检查是否被反自动化重定向到公开站
+        if self._is_cr_public_site(page.url):
+            logger.error(
+                "门户被重定向到公开站（反自动化检测）: %s — "
+                "ICRIS 检测到 Playwright TLS/HTTP 指纹，"
+                "请尝试: 1) 使用 CDP 连接真实 Chrome; 2) 增强 stealth 伪装",
+                page.url,
+            )
+            return False
+
+        try:
+            await page.wait_for_url("**/e-services.cr.gov.hk/**/home.do**", timeout=timeout_ms)
+        except Exception:
+            pass
+
+        # 再次检查重定向
+        if self._is_cr_public_site(page.url):
+            logger.error("门户在 wait_for_url 后被重定向到公开站: %s", page.url)
+            return False
+
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const href = window.location.href;
+                    if (!href.includes('e-services.cr.gov.hk')) return false;
+                    if (href.includes('www.cr.gov.hk') && !href.includes('e-services')) return false;
+                    return /home\\.do|systemclock=/i.test(href)
+                        || document.querySelector('header, .header, #header');
+                }""",
+                timeout=timeout_ms,
+            )
+            return True
+        except Exception:
+            if self._is_cr_public_site(page.url):
+                logger.error("门户 wait_for_function 后被重定向到公开站: %s", page.url)
+                return False
+            return "e-services.cr.gov.hk" in page.url and not self._is_cr_public_site(page.url)
+
+    async def _wait_systemclock_in_url(self, page: "Page", timeout_ms: int = 15000) -> str | None:
+        """等待 URL 出现 systemclock 参数"""
+        try:
+            await page.wait_for_function(
+                "() => /[?&]systemclock=\\d+/.test(window.location.href)",
+                timeout=timeout_ms,
+            )
+        except Exception:
+            pass
+        return self._extract_systemclock(page.url)
+
+    async def _registration_terms_visible(self, page: "Page") -> bool:
+        if not self._is_registration_page(page.url) or self._is_cr_public_site(page.url):
+            return False
+        # Vue 挂载后 URL 会追加 #，此时条款控件可能仍在渲染
+        if "#" in page.url:
+            return True
+        return (
+            await page.locator(
+                "input[type='checkbox'], input#checkCode, form[action*='registration' i]"
+            ).count()
+            > 0
+        )
+
+    async def _open_registration_with_clock(
+        self, page: "Page", systemclock: str
+    ) -> "Page | None":
+        """用门户 session 的 systemclock 打开注册条款页（导航阶段不切换语言）"""
+        reg_url = build_registration_url(systemclock)
+        for attempt in range(1, 3):
+            logger.info("打开注册页 (尝试 %d/2): %s", attempt, reg_url[:100])
+            await page.goto(reg_url, wait_until="commit", timeout=45000)
+
+            # 检查是否被重定向到公开站
+            if self._is_cr_public_site(page.url):
+                logger.error("注册页被重定向到公开站（反自动化检测）: %s", page.url)
+                await self._dump_page_diagnostics(page, "注册页重定向")
+                return None
+
+            vue_ok = await self._wait_registration_vue(page, timeout=45000)
+            if not vue_ok:
+                probe = await self._registration_page_probe(page)
+                logger.warning(
+                    "注册页 Vue 未挂载 (尝试 %d/2) probe=%s",
+                    attempt,
+                    {k: probe.get(k) for k in ("spinning", "checkCode", "checkbox", "bodySample")},
+                )
+                # 输出完整诊断信息
+                await self._dump_page_diagnostics(page, f"Vue未挂载-{attempt}")
+                if self._is_registration_page(page.url) and await self._registration_terms_ready(page):
+                    logger.info("URL 已在 registration，按条款页就绪继续")
+                    await self._log_page(page, "注册页加载")
+                    return page
+                if attempt < 2:
+                    await page.reload(wait_until="commit", timeout=45000)
+                continue
+            await self._wait_spin_clear(page, timeout_ms=20000)
+            await self._log_page(page, "注册页加载")
+            if await self._registration_terms_ready(page):
+                return page
+            logger.warning("注册页已加载但条款控件未就绪 (尝试 %d/2)", attempt)
+        return None
+
+    async def _wait_portal_register_control(self, page: "Page", timeout: int = 15000):
+        """等待门户 Vue 渲染「立即登记」控件，返回可点击的 Locator 或 None"""
+        pattern = re.compile(r"立即登[记記]")
+        candidates = [
+            page.get_by_role("button", name=pattern),
+            page.get_by_role("link", name=pattern),
+            page.locator("button, a").filter(has_text=pattern),
+        ]
+        deadline = time.time() + timeout / 1000
+        while time.time() < deadline:
+            for loc in candidates:
+                if await loc.count() > 0:
+                    return loc.first
+            await page.wait_for_timeout(_POLL_MS)
+        return None
+
+    async def _click_portal_register(self, page: "Page") -> "Page | None":
+        """点击门户「立即登记」，成功则返回注册页 Page"""
+        register_btn = await self._wait_portal_register_control(page, timeout=12000)
+        if register_btn is None:
+            return None
+
+        logger.info("点击「立即登记」")
+        try:
+            async with page.context.expect_page(timeout=6000) as new_page_info:
+                await register_btn.click()
+            new_page = await new_page_info.value
+            await new_page.wait_for_load_state("commit", timeout=20000)
+            page = new_page
+            logger.info("立即登记在新标签页打开")
+        except Exception:
+            await register_btn.click()
+
+        try:
+            await page.wait_for_url("**/registration/**", timeout=20000)
+            await self._wait_spin_clear(page, timeout_ms=20000)
+            await self._log_page(page, "立即登记后")
+            if self._is_registration_page(page.url):
+                return page
+        except Exception as e:
+            logger.warning("点击立即登记未进入 registration: %s", e)
+        return None
+
+    def _is_registration_page(self, url: str) -> bool:
+        path = urlparse(url).path.lower()
+        return "/registration/" in path and "s0" in path
+
+    def _is_cr_public_site(self, url: str) -> bool:
+        """是否被重定向到公司注册处公开网站（非 e-services 子域）"""
+        host = urlparse(url).netloc.lower()
+        if "e-services.cr.gov.hk" in host:
+            return False
+        return "cr.gov.hk" in host
+
+    def _extract_systemclock(self, url: str) -> str | None:
+        match = re.search(r"[?&]systemclock=(\d+)", url)
+        return match.group(1) if match else None
+
+    def _is_home_or_portal(self, url: str) -> bool:
+        if self._is_registration_page(url):
+            return False
+        if self._is_cr_public_site(url):
+            return True
+        lower = url.lower()
+        return any(
+            token in lower
+            for token in ("home.do", "/index", "/portal", "/main.do", "login.do")
+        )
+
+    async def _dismiss_portal_overlays(self, page: "Page") -> None:
+        """关闭 Cookie 横幅、维护通知弹窗等遮挡层"""
+        try:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(200)
+        except Exception:
+            pass
+        close_selectors = [
+            "#notification-modal .close",
+            "#notification-modal button.close",
+            "#notification-modal [data-dismiss='modal']",
+            ".modal.show .btn-close",
+            ".modal.show button.close",
+        ]
+        for sel in close_selectors:
+            btn = page.locator(sel).first
+            if await btn.count() > 0 and await btn.is_visible():
+                await btn.click()
+                await page.wait_for_timeout(500)
+                logger.info("已关闭通知弹窗")
+                break
+        else:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(300)
+
+        cookie_btn = page.locator(
+            ".cookie-banner button, .cookie-bar button, "
+            "[class*='cookie'] button:has-text('接受')"
+        ).first
+        if await cookie_btn.count() > 0 and await cookie_btn.is_visible():
+            await cookie_btn.click()
+            await page.wait_for_timeout(500)
+            logger.info("已接受 Cookie 横幅")
+        else:
+            await self._dismiss_cookie_banner(page)
+
+    async def _dismiss_cookie_banner(self, page: "Page") -> None:
+        """关掉 #icris3-cookie-policy 底部横幅；没有则跳过。不点条款接受。"""
+        if page.is_closed():
+            return
+        try:
+            root = page.locator("#icris3-cookie-policy")
+            if await root.count() == 0:
+                return
+            btn = root.locator(
+                "button, a, [role=button], input[type=button], input[type=submit]"
+            ).first
+            clicked = False
+            if await btn.count() > 0 and await btn.is_visible():
+                try:
+                    await btn.click(timeout=2000)
+                    clicked = True
+                except Exception:
+                    clicked = bool(
+                        await page.evaluate(
+                            """() => {
+                              const root = document.getElementById('icris3-cookie-policy');
+                              if (!root) return false;
+                              const el = root.querySelector(
+                                'button, a, [role=button], input[type=button], input[type=submit]'
+                              );
+                              if (!el) return false;
+                              el.click();
+                              return true;
+                            }"""
+                        )
+                    )
+            if clicked:
+                await page.wait_for_timeout(400)
+                logger.info("已点击 Cookie 横幅接受")
+                return
+            hidden = await page.evaluate(
+                """() => {
+                  const el = document.getElementById('icris3-cookie-policy');
+                  if (!el) return false;
+                  const st = getComputedStyle(el);
+                  if (st.display === 'none' || st.visibility === 'hidden') return false;
+                  el.style.setProperty('display', 'none', 'important');
+                  return true;
+                }"""
+            )
+            if hidden:
+                logger.info("已隐藏 Cookie 横幅")
+        except Exception as e:
+            logger.debug("关闭 Cookie 横幅跳过: %s", e)
+
+    async def _page_language_state(self, page: "Page") -> str:
+        """返回页面语言状态: simplified | traditional | unknown"""
+        url = (page.url or "").lower()
+        if "locale=zh_tw" in url or "lang=zh_tw" in url:
+            return "traditional"
+        if "locale=zh_cn" in url or "lang=zh_cn" in url:
+            return "simplified"
+        return await page.evaluate(
+            """() => {
+                const text = document.body ? document.body.innerText : '';
+                // S02/门户 + S03 用户资料繁体特征
+                if (/用戶類別|擬訂用的服務|帳戶資料|公司註冊處|首頁|填寫用戶資料|英文姓氏|通訊語言|非香港地址|國家／地區|國家\\/地區|稱謂/.test(text))
+                    return 'traditional';
+                if (/用户类别|拟订用的服务|账户资料|公司注册处|首页|填写用户资料|英文姓氏|通讯语言|非香港地址|国家\\/地区|称谓/.test(text)
+                    && !/用戶類別|填寫用戶資料|通訊語言|稱謂/.test(text))
+                    return 'simplified';
+                const header = document.querySelector('header, .header, #header');
+                const headerText = header ? header.innerText : '';
+                if (/公司註冊處|首頁/.test(headerText)) return 'traditional';
+                if (/公司注册处|首页/.test(headerText)) return 'simplified';
+                return 'unknown';
+            }"""
+        )
+
+    async def _is_simplified_chinese_active(self, page: "Page") -> bool:
+        state = await self._page_language_state(page)
+        if state == "simplified":
+            return True
+        if state == "traditional":
+            return False
+        # 页头有「繁」可点、无繁体正文时，视为已是简体
+        fan = page.locator("a").filter(has_text=re.compile(r"^繁$"))
+        if await fan.count() > 0 and await fan.first.is_visible():
+            return True
+        return False
+
+    async def _wait_language_simplified(self, page: "Page", timeout_ms: int = 15000) -> bool:
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const text = document.body ? document.body.innerText : '';
+                    if (/用戶類別|擬訂用的服務|公司註冊處|首頁/.test(text)) return false;
+                    return /用户类别|拟订用的服务|公司注册处|首页/.test(text);
+                }""",
+                timeout=timeout_ms,
+            )
+            return True
+        except Exception:
+            return await self._is_simplified_chinese_active(page)
+
+    async def _find_jian_link_info(self, page: "Page") -> dict | None:
+        """定位页头「简」语言链接元数据"""
+        return await page.evaluate(
+            """() => {
+                const items = [];
+                for (const el of document.querySelectorAll('a, button, span, li')) {
+                    const t = (el.innerText || el.textContent || '').replace(/\\s+/g, '');
+                    if (t !== '简') continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0 || r.top > 260) continue;
+                    const link = el.closest('a') || (el.tagName === 'A' ? el : null);
+                    const target = link || el;
+                    items.push({
+                        tag: target.tagName,
+                        href: target.href || target.getAttribute('href') || '',
+                        onclick: target.getAttribute('onclick') || '',
+                        top: r.top,
+                        left: r.left,
+                        id: target.id || '',
+                        cls: (target.className || '').slice(0, 80),
+                    });
+                }
+                items.sort((a, b) => a.top - b.top || a.left - b.left);
+                return items[0] || null;
+            }"""
+        )
+
+    async def _activate_jian_link(self, page: "Page", info: dict) -> str:
+        """尝试多种方式触发「简」切换，返回使用的方法名"""
+        href = (info.get("href") or "").strip()
+        if href and not href.lower().startswith("javascript"):
+            await page.goto(href, wait_until="commit", timeout=60000)
+            return f"goto:{href[:80]}"
+
+        result = await page.evaluate(
+            """() => {
+                for (const el of document.querySelectorAll('a, button, span, li')) {
+                    const t = (el.innerText || el.textContent || '').replace(/\\s+/g, '');
+                    if (t !== '简') continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0 || r.top > 260) continue;
+                    const target = el.closest('a') || el;
+                    target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                    target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                    target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                    if (typeof target.click === 'function') target.click();
+                    return { ok: true, tag: target.tagName, href: target.href || '' };
+                }
+                return { ok: false };
+            }"""
+        )
+        if result and result.get("ok"):
+            return f"js-click:{result.get('tag')}"
+
+        loc = page.locator("a").filter(has_text=re.compile(r"^简$")).first
+        if await loc.count() == 0:
+            loc = page.get_by_text("简", exact=True).first
+        await loc.scroll_into_view_if_needed()
+        await loc.click(force=True, timeout=5000)
+        return "playwright-force-click"
+
+    async def _ensure_simplified_chinese(self, page: "Page") -> bool:
+        """点击页头右上角「简」切换为简体中文；已是简体则跳过"""
+        await dismiss_google_translate(page)
+        if self._locale == "simplified":
+            return True
+        state = await self._page_language_state(page)
+        if state == "simplified" or await self._is_simplified_chinese_active(page):
+            logger.info("页面已是简体中文，跳过语言切换")
+            self._locale = "simplified"
+            return True
+
+        info = await self._find_jian_link_info(page)
+        if not info:
+            logger.warning("未找到页头「简」链接 (state=%s)", state)
+            return False
+
+        logger.info(
+            "找到「简」入口: tag=%s href=%s class=%s",
+            info.get("tag"),
+            (info.get("href") or "")[:100],
+            info.get("cls"),
+        )
+
+        for attempt in range(1, 4):
+            try:
+                method = await self._activate_jian_link(page, info)
+                logger.info("已触发「简」切换 (尝试 %d/3, 方式=%s)", attempt, method)
+                if await self._wait_language_simplified(page, timeout_ms=12000):
+                    logger.info("语言已切换为简体中文")
+                    self._locale = "simplified"
+                    return True
+                await page.wait_for_timeout(_FORM_PAUSE_MS)
+            except Exception as e:
+                logger.warning("「简」切换尝试 %d 失败: %s", attempt, e)
+                await page.wait_for_timeout(500)
+
+        logger.warning("点击「简」后页面仍为繁体 (state=%s)", await self._page_language_state(page))
+        return await self._fallback_locale_url(page)
+
+    def _url_with_simplified_locale(self, url: str) -> str:
+        """在 URL 上附加/覆盖简体 locale 参数"""
+        parsed = urlparse(url)
+        qs = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        for key in ("locale", "lang", "request_locale", "language"):
+            if key in qs:
+                qs[key] = "zh_CN"
+                break
+        else:
+            qs["locale"] = "zh_CN"
+        new_query = urlencode(qs)
+        return parsed._replace(query=new_query).geturl()
+
+    async def _fallback_locale_url(self, page: "Page") -> bool:
+        """回退：通过 URL 参数 / Cookie 强制简体"""
+        try:
+            await page.context.add_cookies(
+                [
+                    {
+                        "name": "locale",
+                        "value": "zh_CN",
+                        "domain": "www.e-services.cr.gov.hk",
+                        "path": "/",
+                    },
+                    {
+                        "name": "lang",
+                        "value": "zh_CN",
+                        "domain": ".e-services.cr.gov.hk",
+                        "path": "/",
+                    },
+                ]
+            )
+        except Exception as e:
+            logger.debug("设置 locale Cookie 失败: %s", e)
+
+        locale_url = self._url_with_simplified_locale(page.url)
+        if locale_url != page.url:
+            logger.info("回退：通过 URL 参数切换简体 %s", locale_url[:120])
+            await page.goto(locale_url, wait_until="commit", timeout=60000)
+            await page.wait_for_timeout(1500)
+            if await self._wait_language_simplified(page, timeout_ms=10000):
+                return True
+        return await self._is_simplified_chinese_active(page)
+
+    async def _is_traditional_chinese_active(self, page: "Page") -> bool:
+        url = (page.url or "").lower()
+        if "locale=zh_tw" in url or "lang=zh_tw" in url:
+            return True
+        if self._locale == "traditional":
+            return True
+        state = await self._page_language_state(page)
+        if state == "traditional":
+            return True
+        # 页头有「简」可点 → 当前已是繁体（即使正文特征被误判为简体也不要 URL 重载）
+        jian = page.locator("a").filter(has_text=re.compile(r"^简$"))
+        if await jian.count() > 0 and await jian.first.is_visible():
+            return True
+        fan = page.locator("a").filter(has_text=re.compile(r"^繁$"))
+        # 有「繁」可点 → 当前是简体
+        if await fan.count() > 0 and await fan.first.is_visible():
+            return False
+        if state == "simplified":
+            return False
+        return False
+
+    async def _wait_language_traditional(self, page: "Page", timeout_ms: int = 15000) -> bool:
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const text = document.body ? document.body.innerText : '';
+                    if (/用户类别|拟订用的服务|公司注册处|首页|填写用户资料/.test(text)
+                        && !/用戶類別|公司註冊處|填寫用戶資料|通訊語言/.test(text))
+                        return false;
+                    return /用戶類別|擬訂用的服務|公司註冊處|首頁|填寫用戶資料|通訊語言|稱謂/.test(text)
+                        || /locale=zh_TW/i.test(location.href);
+                }""",
+                timeout=timeout_ms,
+            )
+            return True
+        except Exception:
+            return await self._is_traditional_chinese_active(page)
+
+    async def _find_fan_link_info(self, page: "Page") -> dict | None:
+        """定位页头「繁」语言链接元数据"""
+        return await page.evaluate(
+            """() => {
+                const items = [];
+                for (const el of document.querySelectorAll('a, button, span, li')) {
+                    const t = (el.innerText || el.textContent || '').replace(/\\s+/g, '');
+                    if (t !== '繁') continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0 || r.top > 260) continue;
+                    const link = el.closest('a') || (el.tagName === 'A' ? el : null);
+                    const target = link || el;
+                    items.push({
+                        tag: target.tagName,
+                        href: target.href || target.getAttribute('href') || '',
+                        onclick: target.getAttribute('onclick') || '',
+                        top: r.top,
+                        left: r.left,
+                        id: target.id || '',
+                        cls: (target.className || '').slice(0, 80),
+                    });
+                }
+                items.sort((a, b) => a.top - b.top || a.left - b.left);
+                return items[0] || null;
+            }"""
+        )
+
+    async def _activate_fan_link(self, page: "Page", info: dict) -> str:
+        """尝试多种方式触发「繁」切换，返回使用的方法名"""
+        href = (info.get("href") or "").strip()
+        if href and not href.lower().startswith("javascript"):
+            await page.goto(href, wait_until="commit", timeout=60000)
+            return f"goto:{href[:80]}"
+
+        result = await page.evaluate(
+            """() => {
+                for (const el of document.querySelectorAll('a, button, span, li')) {
+                    const t = (el.innerText || el.textContent || '').replace(/\\s+/g, '');
+                    if (t !== '繁') continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0 || r.top > 260) continue;
+                    const target = el.closest('a') || el;
+                    target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                    target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                    target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                    if (typeof target.click === 'function') target.click();
+                    return { ok: true, tag: target.tagName, href: target.href || '' };
+                }
+                return { ok: false };
+            }"""
+        )
+        if result and result.get("ok"):
+            return f"js-click:{result.get('tag')}"
+
+        loc = page.locator("a").filter(has_text=re.compile(r"^繁$")).first
+        if await loc.count() == 0:
+            loc = page.get_by_text("繁", exact=True).first
+        await loc.scroll_into_view_if_needed()
+        await loc.click(force=True, timeout=5000)
+        return "playwright-force-click"
+
+    def _url_with_traditional_locale(self, url: str) -> str:
+        parsed = urlparse(url)
+        qs = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        for key in ("locale", "lang", "request_locale", "language"):
+            if key in qs:
+                qs[key] = "zh_TW"
+                break
+        else:
+            qs["locale"] = "zh_TW"
+        new_query = urlencode(qs)
+        return parsed._replace(query=new_query).geturl()
+
+    async def _fallback_traditional_locale_url(self, page: "Page") -> bool:
+        """回退：通过 URL 参数 / Cookie 强制繁体"""
+        try:
+            await page.context.add_cookies(
+                [
+                    {
+                        "name": "locale",
+                        "value": "zh_TW",
+                        "domain": "www.e-services.cr.gov.hk",
+                        "path": "/",
+                    },
+                    {
+                        "name": "lang",
+                        "value": "zh_TW",
+                        "domain": ".e-services.cr.gov.hk",
+                        "path": "/",
+                    },
+                ]
+            )
+        except Exception as e:
+            logger.debug("设置繁体 locale Cookie 失败: %s", e)
+
+        locale_url = self._url_with_traditional_locale(page.url)
+        if locale_url != page.url:
+            logger.info("回退：通过 URL 参数切换繁体 %s", locale_url[:120])
+            await page.goto(locale_url, wait_until="commit", timeout=60000)
+            await page.wait_for_timeout(1500)
+            if await self._wait_language_traditional(page, timeout_ms=10000):
+                return True
+        return await self._is_traditional_chinese_active(page)
+
+    async def _ensure_traditional_chinese(self, page: "Page") -> bool:
+        """点击页头右上角「繁」切换为繁体中文；已是繁体则跳过（避免 URL 重载打回 s03）。"""
+        await dismiss_google_translate(page)
+        if await self._is_traditional_chinese_active(page):
+            self._locale = "traditional"
+            logger.info("页面已是繁体中文，跳过语言切换")
+            return True
+
+        info = await self._find_fan_link_info(page)
+        if not info:
+            # 无「繁」且已在注册表单：勿用 URL 重载，以免清空已填 s03
+            if self._is_user_info_url(page.url) or self._is_identity_proof_url(page.url):
+                logger.info(
+                    "未找到「繁」链接且已在注册步骤，跳过 URL 切繁以免重载 (url=%s)",
+                    page.url[:100],
+                )
+                self._locale = "traditional"
+                return True
+            logger.warning("未找到页头「繁」链接 (state=%s)", await self._page_language_state(page))
+            ok = await self._fallback_traditional_locale_url(page)
+            if ok:
+                self._locale = "traditional"
+            return ok
+
+        logger.info(
+            "找到「繁」入口: tag=%s href=%s class=%s",
+            info.get("tag"),
+            (info.get("href") or "")[:100],
+            info.get("cls"),
+        )
+
+        for attempt in range(1, 4):
+            try:
+                method = await self._activate_fan_link(page, info)
+                logger.info("已触发「繁」切换 (尝试 %d/3, 方式=%s)", attempt, method)
+                if await self._wait_language_traditional(page, timeout_ms=12000):
+                    logger.info("语言已切换为繁体中文")
+                    self._locale = "traditional"
+                    return True
+                await page.wait_for_timeout(800)
+            except Exception as e:
+                logger.warning("「繁」切换尝试 %d 失败: %s", attempt, e)
+                await page.wait_for_timeout(500)
+
+        logger.warning("点击「繁」后页面仍为简体 (state=%s)", await self._page_language_state(page))
+        if self._is_user_info_url(page.url) or self._is_identity_proof_url(page.url):
+            logger.info("注册步骤上跳过 URL 切繁重载")
+            self._locale = "traditional"
+            return True
+        ok = await self._fallback_traditional_locale_url(page)
+        if ok:
+            self._locale = "traditional"
+        return ok
+
+    async def _navigate_to_registration(self, page: "Page") -> "Page | None":
+        """
+        进入注册页流程，成功返回当前 Page（可能是新标签页），失败返回 None。
+
+        增强了对反自动化重定向的检测和诊断。
+        """
+        logger.info("进入电子服务门户: %s", PORTAL_URL)
+        for attempt in range(1, 3):
+            try:
+                await page.goto(PORTAL_URL, wait_until="commit", timeout=45000)
+                break
+            except Exception as e:
+                logger.warning("门户页加载 (尝试 %d/2): %s", attempt, e)
+                if "ERR_PROXY" in str(e):
+                    logger.error(
+                        "疑似系统代理导致连接失败，请确认 .env 中 BROWSER_NO_PROXY=true"
+                    )
+                    return None
+                if attempt >= 2:
+                    logger.error("无法打开门户页: %s", e)
+                    return None
+                await page.wait_for_timeout(1500)
+
+        # 检测是否被反自动化重定向
+        if self._is_cr_public_site(page.url):
+            logger.error(
+                "门户被重定向到公开站（HTTP 层反自动化检测）: %s — "
+                "ICRIS 服务端检测到 Playwright TLS/HTTP 指纹。"
+                "解决方案: 1) 确保本机安装了 Chrome; "
+                "2) 程序会自动尝试 CDP 连接真实 Chrome; "
+                "3) 或手动设置 CHROME_USE_EXISTING=true 连接已开的 Chrome",
+                page.url,
+            )
+            await self._dump_page_diagnostics(page, "门户重定向")
+            return None
+
+        if not await self._wait_portal_session(page, timeout_ms=20000):
+            # 再次检查是否被重定向
+            if self._is_cr_public_site(page.url):
+                logger.error(
+                    "门户加载后重定向到公开站: %s — ICRIS 反自动化检测",
+                    page.url,
+                )
+                await self._dump_page_diagnostics(page, "门户加载后重定向")
+                return None
+            await self._log_page(page, "门户加载失败")
+            await self._dump_page_diagnostics(page, "门户加载失败")
+            return None
+
+        await self._log_page(page, "门户加载")
+        if self._is_cr_public_site(page.url):
+            logger.error("被 disable-devtool 重定向到公开网站: %s", page.url)
+            return None
+
+        await self._dismiss_portal_overlays(page)
+
+        systemclock = await self._wait_systemclock_in_url(page, timeout_ms=12000)
+        if not systemclock:
+            await page.wait_for_timeout(800)
+            systemclock = self._extract_systemclock(page.url)
+
+        if systemclock:
+            opened = await self._open_registration_with_clock(page, systemclock)
+            if opened:
+                return opened
+            logger.warning("systemclock 直链未加载条款页，刷新门户会话后重试")
+            await page.goto(PORTAL_URL, wait_until="commit", timeout=45000)
+            await self._wait_portal_session(page, timeout_ms=15000)
+            systemclock = await self._wait_systemclock_in_url(page, timeout_ms=12000)
+            if systemclock:
+                opened = await self._open_registration_with_clock(page, systemclock)
+                if opened:
+                    return opened
+
+        clicked = await self._click_portal_register(page)
+        if clicked and await self._registration_terms_ready(clicked):
+            return clicked
+
+        if self._is_registration_page(page.url):
+            await self._wait_spin_clear(page, timeout_ms=30000)
+            if await self._registration_terms_ready(page):
+                logger.info("已在 registration URL，继续流程: %s", page.url[:120])
+                return page
+            probe = await self._registration_page_probe(page)
+            logger.warning("registration URL 但条款未就绪: %s", probe)
+
+        logger.error("未能进入注册页，当前 URL: %s", page.url)
+        return None
+
+    async def _ensure_on_registration(self, page: "Page", step_label: str) -> bool:
+        await self._log_page(page, step_label)
+        if self._is_cr_public_site(page.url):
+            logger.error("已跳转到公司注册处公开网站: %s", page.url)
+            return False
+        if self._is_home_or_portal(page.url):
+            logger.error("已跳转到首页/门户，停止后续操作: %s", page.url)
+            return False
+        if not self._is_registration_page(page.url):
+            logger.warning("当前不在 registration 流程页: %s", page.url)
+        return True
+
+    async def _fill_captcha(self, page: "Page") -> bool:
+        return await fill_icris_captcha(page, self.llm)
+
+    async def _get_terms_form(self, page: "Page"):
+        """定位条款页表单，避免点到页头/页脚导航链接"""
+        candidates = [
+            "form[action*='registration' i]",
+            "form[action*='s01' i]",
+            "form:has(input[type='checkbox'])",
+        ]
+        for sel in candidates:
+            form = page.locator(sel).first
+            if await form.count() > 0:
+                return form
+        return page.locator("form").first
+
+    async def _accept_terms(self, page: "Page") -> bool:
+        """
+        仅在 registration 表单内勾选条款并点击提交型「接受」按钮。
+        不点击 <a> 链接，防止误触导航回首页。
+        """
+        form = await self._get_terms_form(page)
+        if await form.count() == 0:
+            logger.warning("未找到条款表单")
+            return False
+
+        checkboxes = form.locator("input[type='checkbox']")
+        cb_count = await checkboxes.count()
+        checked = False
+        for i in range(cb_count):
+            cb = checkboxes.nth(i)
+            if not await cb.is_visible():
+                continue
+            if not await cb.is_checked():
+                await cb.check()
+            checked = True
+            logger.info("已勾选条款复选框 (%d/%d)", i + 1, cb_count)
+
+        if not checked:
+            logger.warning("条款页未找到可勾选 checkbox")
+            return False
+
+        accept_selectors = [
+            "input[type='submit'][value*='Accept' i]",
+            "input[type='submit'][value*='接受']",
+            "input[type='button'][value*='Accept' i]",
+            "input[type='button'][value*='接受']",
+            "button[type='submit']",
+            "button:has-text('Accept')",
+            "button:has-text('接 受')",
+            "button:has-text('接受')",
+        ]
+        for sel in accept_selectors:
+            btn = form.locator(sel).first
+            if await btn.count() > 0 and await btn.is_visible():
+                current_url = page.url
+                await btn.click()
+                logger.info("已点击条款接受按钮: %s", sel)
+
+                try:
+                    await page.wait_for_function(
+                        "(url) => window.location.href !== url",
+                        current_url,
+                        timeout=15000,
+                    )
+                except Exception:
+                    pass
+
+                if not await self._wait_spin_clear(page, timeout_ms=30000):
+                    raise IcrisLoadingTimeoutError(
+                        register_loading_timeout_message("s01")
+                    )
+
+                await self._log_page(page, "接受条款后")
+                if self._is_home_or_portal(page.url):
+                    logger.error("点击接受后跳转到首页，可能验证码错误或会话失效")
+                    return False
+                return True
+
+        logger.warning("条款表单内未找到 Accept/接受 按钮")
+        return False
+
+    def _is_account_profile_url(self, url: str) -> bool:
+        lower = url.lower()
+        return bool(re.search(r"registration/s0[2-9]", lower) or re.search(r"[#/]s0[2-9]", lower))
+
+    async def _is_account_profile_step(self, page: "Page") -> bool:
+        """是否为账户资料步骤（URL s02+ 或页面含用户类别）"""
+        if self._is_account_profile_url(page.url):
+            return True
+        return bool(
+            await page.evaluate(
+                """() => {
+                    const t = document.body ? document.body.innerText : '';
+                    return /用户类别|用戶類別|账户资料|帳戶資料|拟订用的服务|擬訂用的服務/.test(t);
+                }"""
+            )
+        )
+
+    async def _wait_for_account_profile_step(self, page: "Page", timeout_ms: int = 60000) -> bool:
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const href = window.location.href;
+                    if (/registration\\/s0[2-9]/i.test(href) || /[#/]s0[2-9]/i.test(href)) return true;
+                    const t = document.body ? document.body.innerText : '';
+                    return /用户类别|用戶類別|账户资料|帳戶資料/.test(t);
+                }""",
+                timeout=timeout_ms,
+            )
+            return True
+        except Exception:
+            return await self._is_account_profile_step(page)
+
+    async def _is_user_profile_step(self, page: "Page") -> bool:
+        """兼容旧名：账户资料步骤"""
+        return await self._is_account_profile_step(page)
+
+    async def _fill_ant_form_by_label(self, page: "Page", label_pattern: str, value: str) -> bool:
+        """通过 ant-form-item 标签填写（兼容 Vue 双向绑定）"""
+        if not value:
+            return False
+        ok = await page.evaluate(
+            """([pat, val]) => {
+                const re = new RegExp(pat, 'i');
+                const setNativeValue = (el, v) => {
+                    const Ctor = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement : HTMLInputElement;
+                    const setter = Object.getOwnPropertyDescriptor(Ctor.prototype, 'value').set;
+                    setter.call(el, v);
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                };
+                const items = document.querySelectorAll('.ant-form-item, .form-group, tr, .ant-row');
+                for (const item of items) {
+                    const label = item.querySelector(
+                        '.ant-form-item-label, label, .control-label, th, .label'
+                    );
+                    const labelText = label ? (label.innerText || '').trim() : '';
+                    if (!labelText || !re.test(labelText)) continue;
+                    const inp = item.querySelector(
+                        "input:not([type='checkbox']):not([type='radio']):not([type='hidden']), textarea, .ant-input"
+                    );
+                    if (!inp) continue;
+                    inp.focus();
+                    setNativeValue(inp, val);
+                    return true;
+                }
+                return false;
+            }""",
+            [label_pattern, value],
+        )
+        if ok:
+            logger.info("已填写表单项 [%s]", label_pattern)
+            return True
+
+        section = await self._get_ant_form_item_by_label(page, label_pattern)
+        inp = section.locator(
+            "input:not([type='checkbox']):not([type='radio']):not([type='hidden']), textarea, .ant-input"
+        ).first
+        if await inp.count() > 0:
+            try:
+                await inp.scroll_into_view_if_needed()
+                await inp.click()
+                await inp.fill(value)
+                await inp.dispatch_event("input")
+                await inp.dispatch_event("change")
+                logger.info("Playwright 已填写表单项 [%s]", label_pattern)
+                return True
+            except Exception:
+                pass
+        return False
+
+    async def _account_form_is_ready(self, page: "Page") -> bool:
+        """非阻塞：账户资料原生控件是否已挂载。"""
+        try:
+            return bool(
+                await page.evaluate(
+                    """() => {
+                        const hasNative = !!document.querySelector(
+                            '#userType, #userId, #password'
+                        );
+                        const hasMarker = /用户类别|用戶類別|拟订用的服务|擬訂用的服務/.test(
+                            document.body ? document.body.innerText : ''
+                        );
+                        return hasMarker && hasNative;
+                    }"""
+                )
+            )
+        except Exception:
+            return False
+
+    async def _wait_for_account_form_ready(self, page: "Page", timeout_ms: int = 45000) -> bool:
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const hasNative = !!document.querySelector('#userType, #userId, #password');
+                    const hasMarker = /用户类别|用戶類別|拟订用的服务|擬訂用的服務/.test(
+                        document.body ? document.body.innerText : ''
+                    );
+                    return hasMarker && hasNative;
+                }""",
+                timeout=timeout_ms,
+            )
+            await page.wait_for_timeout(600)
+            return True
+        except Exception:
+            return await self._account_form_is_ready(page)
+
+    async def _get_account_profile_status(self, page: "Page") -> dict[str, bool]:
+        return await page.evaluate(
+            """() => {
+                const userType = document.querySelector('#userType');
+                let userCategory = false;
+                if (userType) {
+                    const opt = userType.options[userType.selectedIndex];
+                    userCategory = userType.value === '0' || /个人|個人/.test((opt && opt.textContent) || '');
+                }
+                if (!userCategory) {
+                    for (const el of document.querySelectorAll(
+                        '.ant-select-selection-item, .ant-select-selection-selected-value'
+                    )) {
+                        const t = (el.innerText || '').replace(/\\s+/g, '');
+                        if (/^个人$|^個人$/.test(t)) { userCategory = true; break; }
+                    }
+                }
+                const checked = v => {
+                    const el = document.querySelector(`input[type=checkbox][value="${v}"]`);
+                    return !!(el && el.checked);
+                };
+                let electronicSubmit = checked('filing');
+                if (!electronicSubmit) {
+                    for (const wrap of document.querySelectorAll('.ant-checkbox-wrapper')) {
+                        const t = (wrap.innerText || '').replace(/\\s+/g, '').slice(0, 12);
+                        if (!/^电子提交$|^電子提交$/.test(t)) continue;
+                        const inp = wrap.querySelector('input[type=checkbox]');
+                        if (inp && inp.checked) { electronicSubmit = true; break; }
+                        if (wrap.classList.contains('ant-checkbox-wrapper-checked')) {
+                            electronicSubmit = true; break;
+                        }
+                    }
+                }
+                const radioChecked = (n, v) => {
+                    const el = document.querySelector(`input[type=radio][name="${n}"][value="${v}"]`);
+                    return !!(el && el.checked);
+                };
+                const val = id => {
+                    const el = document.querySelector(`#${id}`);
+                    return !!(el && el.value);
+                };
+                return {
+                    userCategory,
+                    electronicSubmit,
+                    electronicSearch: checked('search'),
+                    primaryAccount: radioChecked('serviceType', 'principal'),
+                    username: val('userId'),
+                    password: val('password'),
+                    confirmPassword: val('confirm'),
+                };
+            }"""
+        )
+
+    async def _log_account_profile_status(self, page: "Page", prefix: str = "") -> None:
+        status = await self._get_account_profile_status(page)
+        logger.info("%s账户资料状态: %s", prefix, status)
+
+    async def _locate_user_category_select(self, page: "Page"):
+        """定位「用户类别」下拉框"""
+        patterns = [
+            page.locator(".ant-select").filter(
+                has=page.locator(
+                    ".ant-select-selection-placeholder, .ant-select-selection-item"
+                ).filter(has_text=re.compile(r"用户类别|用戶類別|个人|個人"))
+            ),
+            page.locator(".ant-form-item, .form-group, div").filter(
+                has_text=re.compile(r"^用户类别$|^用戶類別$|用户类别|用戶類別")
+            ).locator(".ant-select"),
+            page.locator(".ant-select"),
+        ]
+        for loc in patterns:
+            if await loc.count() > 0:
+                return loc.first
+        return page.locator(".ant-select").first
+
+    async def _open_user_category_dropdown(self, page: "Page") -> bool:
+        user_select = await self._locate_user_category_select(page)
+        if await user_select.count() == 0:
+            return False
+        triggers = [
+            user_select.locator(".ant-select-selector").first,
+            user_select.locator(".ant-select-arrow").first,
+            user_select.locator("[role='combobox']").first,
+            user_select,
+        ]
+        for trigger in triggers:
+            if await trigger.count() == 0:
+                continue
+            try:
+                await trigger.scroll_into_view_if_needed()
+                await trigger.click(force=True, timeout=5000)
+                await page.wait_for_timeout(700)
+                return True
+            except Exception:
+                continue
+        return False
+
+    async def _pick_select_option_individual(self, page: "Page") -> bool:
+        option_selectors = [
+            ".ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option[title='个人']",
+            ".ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option[title='個人']",
+            ".ant-select-dropdown:not(.ant-select-dropdown-hidden) [title='个人']",
+            ".ant-select-dropdown:not(.ant-select-dropdown-hidden) [title='個人']",
+            ".ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option",
+            "[role='listbox'] [role='option']",
+        ]
+        opt_re = re.compile(r"^个人$|^個人$|Individual", re.I)
+        for sel in option_selectors:
+            options = page.locator(sel)
+            generic_option = (
+                "ant-select-item-option" in sel
+                and "title" not in sel
+                and "[role='option']" not in sel
+            )
+            for i in range(await options.count()):
+                opt = options.nth(i)
+                if not await opt.is_visible():
+                    continue
+                txt = (await opt.inner_text()).strip()
+                if generic_option and not opt_re.search(txt):
+                    continue
+                try:
+                    content = opt.locator(".ant-select-item-option-content").first
+                    target = content if await content.count() > 0 else opt
+                    await target.click(force=True, timeout=3000)
+                    await page.wait_for_timeout(500)
+                    return True
+                except Exception:
+                    continue
+        return await page.evaluate(
+            """() => {
+                const optRe = /^(个人|個人|Individual)$/i;
+                const dds = [...document.querySelectorAll('.ant-select-dropdown')]
+                    .filter(d => d.offsetHeight > 0 && !d.classList.contains('ant-select-dropdown-hidden'));
+                const dd = dds[dds.length - 1];
+                if (!dd) return false;
+                const opts = [...dd.querySelectorAll(
+                    '[title], .ant-select-item-option, .ant-select-item, [role="option"]'
+                )];
+                for (const o of opts) {
+                    const txt = (o.getAttribute('title') || o.innerText || '').trim();
+                    if (!optRe.test(txt)) continue;
+                    const content = o.querySelector('.ant-select-item-option-content') || o;
+                    content.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                    content.click();
+                    return true;
+                }
+                if (opts[0]) {
+                    opts[0].click();
+                    return true;
+                }
+                return false;
+            }"""
+        )
+
+    async def _scroll_registration_form_into_view(self, page: "Page") -> None:
+        await page.evaluate(
+            """() => {
+                const form = document.querySelector('form, .ant-form, #app');
+                if (form) form.scrollIntoView({ block: 'start', behavior: 'instant' });
+            }"""
+        )
+        await page.wait_for_timeout(400)
+
+    def _normalize_form_label(self, text: str) -> str:
+        return re.sub(r"[\s/／\*:：]+", "", (text or "").strip())
+
+    async def _ant_select_surround_text(self, page: "Page", index: int) -> str:
+        """获取第 index 个 ant-select 附近的标签/占位符文字"""
+        try:
+            return await page.evaluate(
+                """(idx) => {
+                    const sel = document.querySelectorAll('.ant-select')[idx];
+                    if (!sel) return '';
+                    const parts = [];
+                    const ph = sel.querySelector('.ant-select-selection-placeholder');
+                    if (ph) parts.push(ph.innerText.trim());
+                    const picked = sel.querySelector('.ant-select-selection-item');
+                    if (picked) parts.push(picked.innerText.trim());
+                    let p = sel.parentElement;
+                    for (let i = 0; i < 10 && p; i++) {
+                        const lbl = p.querySelector(
+                            ':scope > label, :scope > .ant-form-item-label, '
+                            + ':scope > .rowTitle, :scope > .col-form-label'
+                        );
+                        if (lbl && lbl.innerText.trim()) parts.push(lbl.innerText.trim());
+                        const prev = p.previousElementSibling;
+                        if (prev) {
+                            const t = prev.innerText.trim();
+                            if (t && t.length < 120) parts.push(t);
+                        }
+                        p = p.parentElement;
+                    }
+                    return parts.join(' | ');
+                }""",
+                index,
+            )
+        except Exception:
+            return ""
+
+    async def _wait_for_ant_selects(
+        self, page: "Page", min_count: int = 1, timeout_ms: int = 15000
+    ) -> None:
+        try:
+            await page.wait_for_function(
+                f"() => document.querySelectorAll('.ant-select').length >= {min_count}",
+                timeout=timeout_ms,
+            )
+        except Exception:
+            pass
+        await page.wait_for_timeout(_FORM_PAUSE_MS)
+
+    async def _log_ant_selects(self, page: "Page", prefix: str = "") -> None:
+        count = await page.locator(".ant-select").count()
+        rows = []
+        for i in range(min(count, 12)):
+            ctx = (await self._ant_select_surround_text(page, i))[:100]
+            rows.append({"i": i, "context": ctx})
+        logger.info("%s ant-select 列表 (%d): %s", prefix, count, rows)
+
+    async def _read_s03_district_options(
+        self, page: "Page", keywords: list[str]
+    ) -> list[str]:
+        """读出郵遞區號／区下拉的选项原文（原生 select 或打开 ant-select）。"""
+        native = await page.evaluate(
+            """(keywords) => {
+                const norm = s => (s || '').replace(/[\\s/／:*：]/g, '');
+                const kws = keywords.map(k => norm(k)).filter(Boolean);
+                const titles = [...document.querySelectorAll(
+                    '.rowTitle, th, label, .ant-form-item-label, .control-label'
+                )];
+                for (const title of titles) {
+                    const tt = norm((title.innerText || '').trim());
+                    if (!kws.some(k => tt.includes(k))) continue;
+                    const row = title.closest('tr, .ant-form-item, .form-group, fieldset, div');
+                    const sel = row && row.querySelector('select');
+                    if (!sel) continue;
+                    return [...sel.options].map(o => (o.textContent || '').trim())
+                        .filter(t => t && !/請選擇|请选择|^Select$/i.test(t));
+                }
+                return [];
+            }""",
+            keywords,
+        )
+        if native:
+            return [str(x) for x in native if str(x).strip()]
+        opened = await page.evaluate(
+            """(keywords) => {
+                const norm = s => (s || '').replace(/[\\s/／:*：]/g, '');
+                const kws = keywords.map(k => norm(k)).filter(Boolean);
+                const titles = [...document.querySelectorAll(
+                    '.rowTitle, th, label, .ant-form-item-label, .control-label'
+                )];
+                const openAnt = (selectEl) => {
+                    const trigger = selectEl.querySelector(
+                        '.ant-select-selector, .ant-select-arrow'
+                    ) || selectEl;
+                    trigger.scrollIntoView({ block: 'center' });
+                    trigger.dispatchEvent(new MouseEvent('mousedown', {
+                        bubbles: true, cancelable: true
+                    }));
+                    trigger.click();
+                };
+                for (const title of titles) {
+                    const tt = norm((title.innerText || '').trim());
+                    if (!kws.some(k => tt.includes(k))) continue;
+                    const row = title.closest(
+                        'tr, .ant-form-item, .form-group, fieldset, .content, div'
+                    );
+                    const sel = row && row.querySelector(
+                        '.ant-select, [role=combobox]'
+                    );
+                    if (!sel || sel.tagName === 'SELECT') continue;
+                    openAnt(sel);
+                    return true;
+                }
+                return false;
+            }""",
+            keywords,
+        )
+        if not opened:
+            return []
+        try:
+            dd = page.locator(
+                ".ant-select-dropdown:not(.ant-select-dropdown-hidden)"
+            ).last
+            await dd.wait_for(state="visible", timeout=4000)
+            texts = await page.evaluate(
+                """() => [...document.querySelectorAll(
+                    '.ant-select-dropdown:not(.ant-select-dropdown-hidden) '
+                    + '.ant-select-item-option-content, '
+                    + '.ant-select-dropdown:not(.ant-select-dropdown-hidden) '
+                    + '.ant-select-item-option'
+                )].map(el => (el.innerText || '').trim()).filter(Boolean)"""
+            )
+        except Exception:
+            texts = []
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        await page.wait_for_timeout(_FORM_PAUSE_MS)
+        seen: list[str] = []
+        for t in texts or []:
+            s = str(t).strip()
+            if s and s not in seen and not re.search(r"請選擇|请选择|^Select$", s, re.I):
+                seen.append(s)
+        return seen
+
+    async def _select_ant_select_by_keywords(
+        self, page: "Page", keywords: list[str], option: str
+    ) -> bool:
+        """
+        按标签/rowTitle/占位符定位下拉并选择（兼容 strut-address 表格布局）。
+        """
+        if not option:
+            return False
+        opt_re = re.compile(re.escape(option), re.I)
+        kw_norm = [self._normalize_form_label(k) for k in keywords if k]
+
+        await page.evaluate(
+            """() => {
+                const w = document.querySelector('#formWrapper, .formWrapper, main');
+                if (w) w.scrollTop = w.scrollHeight;
+                window.scrollTo(0, document.body.scrollHeight);
+            }"""
+        )
+        await page.wait_for_timeout(_FORM_PAUSE_MS)
+
+        opened = await page.evaluate(
+            """([keywords, option]) => {
+                const norm = s => (s || '').replace(/[\\s/／:*：]/g, '');
+                const kws = keywords.map(k => norm(k));
+                const esc = option.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+                const optRe = new RegExp(esc, 'i');
+
+                const titleEls = [...document.querySelectorAll(
+                    '.rowTitle, th, label, .ant-form-item-label, .control-label'
+                )];
+
+                const pickNative = (sel) => {
+                    const opt = [...sel.options].find(o => optRe.test((o.textContent || '').trim()));
+                    if (!opt) return false;
+                    sel.value = opt.value;
+                    sel.dispatchEvent(new Event('input', { bubbles: true }));
+                    sel.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                };
+
+                const openAnt = (selectEl) => {
+                    const trigger = selectEl.querySelector('.ant-select-selector, .ant-select-arrow')
+                        || selectEl;
+                    trigger.scrollIntoView({ block: 'center' });
+                    trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                    trigger.click();
+                };
+
+                for (const title of titleEls) {
+                    const tt = norm((title.innerText || '').trim());
+                    if (!kws.some(k => k && tt.includes(k))) continue;
+
+                    const containers = [
+                        title.closest('tr'),
+                        title.closest('.ant-row, .row, .form-group, fieldset, .content, .ant-form-item'),
+                        title.parentElement,
+                        title.parentElement?.parentElement,
+                    ].filter(Boolean);
+
+                    for (const container of containers) {
+                        let select = container.querySelector('.ant-select, [role=combobox], select');
+                        if (!select) {
+                            const td = title.closest('td');
+                            const next = td?.nextElementSibling;
+                            if (next) select = next.querySelector('.ant-select, [role=combobox], select');
+                        }
+                        if (!select) continue;
+                        if (select.tagName === 'SELECT') {
+                            if (pickNative(select)) return { mode: 'native', label: title.innerText.trim() };
+                        } else {
+                            openAnt(select);
+                            return { mode: 'ant', label: title.innerText.trim() };
+                        }
+                    }
+                }
+
+                // 回退：扫描全部 ant-select / combobox 的上下文
+                const all = [...document.querySelectorAll('.ant-select, [role=combobox]')];
+                for (let i = 0; i < all.length; i++) {
+                    const sel = all[i];
+                    const parts = [];
+                    const ph = sel.querySelector('.ant-select-selection-placeholder');
+                    if (ph) parts.push(ph.innerText.trim());
+                    let p = sel.parentElement;
+                    for (let d = 0; d < 8 && p; d++) {
+                        const lbl = p.querySelector(':scope > label, :scope > .rowTitle, :scope > .ant-form-item-label');
+                        if (lbl) parts.push(lbl.innerText.trim());
+                        p = p.parentElement;
+                    }
+                    const ctx = norm(parts.join(' | '));
+                    if (!kws.some(k => k && ctx.includes(k))) continue;
+                    if (sel.tagName === 'SELECT') {
+                        if (pickNative(sel)) return { mode: 'native', label: parts.join(' | ') };
+                    } else {
+                        openAnt(sel);
+                        return { mode: 'ant', label: parts.join(' | '), index: i };
+                    }
+                }
+                return { mode: 'none' };
+            }""",
+            [keywords, option],
+        )
+
+        if opened.get("mode") == "native":
+            logger.info("已选原生下拉 [%s] → %s", opened.get("label", ""), option)
+            return True
+        if opened.get("mode") != "ant":
+            await self._log_ant_selects(page, "未匹配")
+            logger.warning("未找到匹配下拉: %s → %s", keywords, option)
+            return False
+
+        logger.info("已打开下拉 [%s] → 选择 %s", opened.get("label", ""), option)
+
+        for attempt in range(3):
+            try:
+                dd = page.locator(
+                    ".ant-select-dropdown:not(.ant-select-dropdown-hidden)"
+                ).last
+                try:
+                    await dd.wait_for(state="visible", timeout=4000)
+                except Exception:
+                    pass
+
+                search = page.locator(
+                    ".ant-select-dropdown:not(.ant-select-dropdown-hidden) input"
+                ).last
+                if await search.count() > 0 and await search.is_visible():
+                    await search.fill("")
+                    await search.type(option, delay=35)
+                    await page.wait_for_timeout(500)
+
+                opt = page.locator(
+                    ".ant-select-dropdown:not(.ant-select-dropdown-hidden) "
+                    ".ant-select-item-option"
+                ).filter(has_text=opt_re).first
+                if await opt.count() > 0:
+                    await opt.click(force=True, timeout=3000)
+                else:
+                    role_opt = page.get_by_role("option", name=opt_re)
+                    if await role_opt.count() > 0:
+                        await role_opt.first.click(force=True, timeout=3000)
+                    else:
+                        await page.keyboard.press("Enter")
+
+                await page.wait_for_timeout(400)
+                verified = await page.evaluate(
+                    """([keywords, option]) => {
+                        const norm = s => (s || '').replace(/[\\s/／:*：]/g, '');
+                        const kws = keywords.map(k => norm(k));
+                        const esc = option.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+                        const optRe = new RegExp(esc, 'i');
+                        const titleEls = [...document.querySelectorAll('.rowTitle, th, label, .ant-form-item-label')];
+                        for (const title of titleEls) {
+                            const tt = norm((title.innerText || '').trim());
+                            if (!kws.some(k => k && tt.includes(k))) continue;
+                            const row = title.closest('tr, .ant-form-item, .content, .row') || title.parentElement;
+                            if (!row) continue;
+                            const txt = row.innerText || '';
+                            if (optRe.test(txt)) return true;
+                        }
+                        return optRe.test(document.body.innerText || '');
+                    }""",
+                    [keywords, option],
+                )
+                if verified:
+                    logger.info("已选下拉 [%s] → %s", keywords[0], option)
+                    return True
+            except Exception as exc:
+                logger.debug("下拉选项点击失败 (尝试 %d): %s", attempt + 1, exc)
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            await page.wait_for_timeout(200)
+
+        logger.warning("未能选择下拉 %s → %s", keywords, option)
+        return await self._select_dropdown_by_rowtitle_playwright(page, keywords, option)
+
+    async def _wait_country_select_visible(self, page: "Page", timeout_ms: int = 15000) -> bool:
+        """非香港地址勾选后，等待「國家／地區」下拉出现。"""
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const norm = s => (s || '').replace(/[\\s/／:*：－-]/g, '');
+                    const kws = ['国家', '國家', '国家地区', '國家地區'];
+                    const titles = [...document.querySelectorAll(
+                        '.rowTitle, th, label, .ant-form-item-label, .control-label'
+                    )];
+                    for (const title of titles) {
+                        const tt = norm((title.innerText || '').trim());
+                        if (!kws.some(k => k && tt.includes(k))) continue;
+                        const row = title.closest('tr, .ant-form-item, .content, .row, .form-group')
+                            || title.parentElement;
+                        if (!row) continue;
+                        const sel = row.querySelector(
+                            '.ant-select:not(.ant-select-disabled), [role=combobox], select'
+                        );
+                        if (sel) return true;
+                        const td = title.closest('td');
+                        const next = td && td.nextElementSibling;
+                        if (next && next.querySelector(
+                            '.ant-select:not(.ant-select-disabled), [role=combobox], select'
+                        )) return true;
+                    }
+                    // 占位「請選擇」且邻近含国家文案
+                    const phs = [...document.querySelectorAll(
+                        '.ant-select-selection-placeholder, .ant-select-selection-item'
+                    )];
+                    for (const ph of phs) {
+                        const t = (ph.innerText || '').trim();
+                        if (!/請選擇|请选择|Select/i.test(t) && t) continue;
+                        let p = ph.closest('.ant-select, [role=combobox]');
+                        if (!p) continue;
+                        let ctx = '';
+                        let n = p.parentElement;
+                        for (let d = 0; d < 6 && n; d++) {
+                            ctx += ' ' + (n.innerText || '');
+                            n = n.parentElement;
+                        }
+                        if (kws.some(k => norm(ctx).includes(k))) return true;
+                    }
+                    return false;
+                }""",
+                timeout=timeout_ms,
+            )
+            return True
+        except Exception:
+            logger.debug("等待国家/地区下拉超时", exc_info=True)
+            return False
+
+    async def _select_non_hk_country_china(self, page: "Page") -> bool:
+        return await self._select_non_hk_country(page, "CHN")
+
+    async def _select_non_hk_country(self, page: "Page", iso3: str = "CHN") -> bool:
+        """非香港地址：按住址国家 ISO 选國家／地區。"""
+        from src.materials.countries import icris_country_select_candidates
+
+        country_kws = [
+            "国家",
+            "國家",
+            "国家/地区",
+            "國家/地區",
+            "国家／地区",
+            "國家／地區",
+        ]
+        options = tuple(icris_country_select_candidates(iso3 or "CHN"))
+
+        await self._wait_country_select_visible(page, timeout_ms=15000)
+        await page.wait_for_timeout(_FORM_PAUSE_MS)
+
+        for option in options:
+            if await self._select_ant_select_by_keywords(page, country_kws, option):
+                logger.info("国家/地区已选: %s iso=%s", option, iso3)
+                return True
+
+        for option in options:
+            if await self._select_dropdown_by_rowtitle_playwright(
+                page, country_kws, option
+            ):
+                logger.info("国家/地区兜底已选: %s iso=%s", option, iso3)
+                return True
+
+        await self._log_ant_selects(page, "国家/地区失败")
+        logger.warning("国家/地区：未能选中 iso=%s options=%s", iso3, options[:4])
+        return False
+
+    async def _select_dropdown_by_rowtitle_playwright(
+        self, page: "Page", keywords: list[str], option: str
+    ) -> bool:
+        """Playwright 回退：按 rowTitle/label 所在表格行定位下拉"""
+        opt_re = re.compile(re.escape(option), re.I)
+        kw_res = [re.compile(re.escape(k), re.I) for k in keywords if k]
+        titles = page.locator(".rowTitle, th, label, .ant-form-item-label, .control-label")
+
+        for i in range(await titles.count()):
+            txt = (await titles.nth(i).inner_text()).strip()
+            if not any(r.search(txt) for r in kw_res):
+                continue
+
+            row = titles.nth(i).locator("xpath=ancestor::tr[1]")
+            scope = row if await row.count() > 0 else titles.nth(i).locator(
+                "xpath=ancestor::*[contains(@class,'content') or contains(@class,'row') or contains(@class,'form-group')][1]"
+            )
+            if await scope.count() == 0:
+                scope = titles.nth(i).locator("xpath=..")
+
+            trigger = scope.locator(
+                ".ant-select-selector, .ant-select, [role=combobox], select"
+            ).first
+            if await trigger.count() == 0:
+                trigger = titles.nth(i).locator(
+                    "xpath=following-sibling::td[1] | following-sibling::div[1]"
+                ).locator(".ant-select-selector, .ant-select, [role=combobox], select").first
+
+            if await trigger.count() == 0:
+                continue
+
+            try:
+                tag = await trigger.evaluate("el => el.tagName")
+                await trigger.scroll_into_view_if_needed()
+                if tag == "SELECT":
+                    await trigger.select_option(label=option)
+                else:
+                    await trigger.click(force=True, timeout=5000)
+                    await page.wait_for_timeout(400)
+                    search = page.locator(
+                        ".ant-select-dropdown:not(.ant-select-dropdown-hidden) input"
+                    ).last
+                    if await search.count() > 0:
+                        await search.fill(option)
+                        await page.wait_for_timeout(400)
+                    opt = page.locator(
+                        ".ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option"
+                    ).filter(has_text=opt_re).first
+                    if await opt.count() > 0:
+                        await opt.click(force=True)
+                    else:
+                        await page.get_by_role("option", name=opt_re).first.click(
+                            force=True, timeout=3000
+                        )
+                await page.wait_for_timeout(400)
+                if opt_re.search(await scope.inner_text()):
+                    logger.info("rowTitle 已选 [%s] → %s", txt[:30], option)
+                    return True
+            except Exception as exc:
+                logger.debug("rowTitle 选择失败 [%s]: %s", txt[:30], exc)
+            await page.keyboard.press("Escape")
+
+        return False
+
+    async def _get_ant_form_item_by_label(self, page: "Page", label_pattern: str):
+        """按 .ant-form-item-label 文字定位表单项（优先最短/最精确标签）"""
+        regex = re.compile(label_pattern, re.I)
+        items = page.locator(".ant-form-item")
+        best = None
+        best_len = 9999
+        for i in range(await items.count()):
+            item = items.nth(i)
+            label = item.locator(".ant-form-item-label, label")
+            if await label.count() == 0:
+                continue
+            txt = (await label.first.inner_text()).strip()
+            norm = self._normalize_form_label(txt)
+            if regex.search(txt) or regex.search(norm):
+                n = len(norm)
+                if n < best_len:
+                    best = item
+                    best_len = n
+        if best is not None:
+            return best
+        return await self._get_labeled_section(page, label_pattern)
+
+    async def _verify_user_category_individual(self, page: "Page") -> bool:
+        return bool(
+            await page.evaluate(
+                """() => {
+                    const sel = document.querySelector('#userType, select[name="userType"], select[id*="userType" i]');
+                    if (sel) {
+                        const opt = sel.options[sel.selectedIndex];
+                        const txt = opt ? (opt.textContent || '').trim() : '';
+                        const val = sel.value;
+                        return val === '0' || /^个人$|^個人$/i.test(txt);
+                    }
+                    const isIndividual = t => /^(个人|個人|Individual)$/i.test((t || '').trim());
+                    const picked = document.querySelector('.ant-select-selection-item');
+                    return !!(picked && isIndividual(picked.innerText));
+                }"""
+            )
+        )
+
+    async def _select_native_user_type_individual(self, page: "Page") -> bool:
+        """用户类别：原生 select#userType，个人 value=0"""
+        if await self._verify_user_category_individual(page):
+            logger.info("用户类别已是「个人」(#userType)")
+            return True
+
+        select = page.locator("#userType, select[name='userType']").first
+        if await select.count() == 0:
+            return False
+
+        for value, label in (("0", "个人"), ("0", "個人")):
+            try:
+                await select.scroll_into_view_if_needed()
+                await select.select_option(value=value)
+                await select.dispatch_event("change")
+                await page.wait_for_timeout(400)
+                if await self._verify_user_category_individual(page):
+                    logger.info("已通过 #userType 选择个人 (value=%s)", value)
+                    return True
+            except Exception:
+                pass
+            try:
+                await select.select_option(label=label)
+                await select.dispatch_event("change")
+                await page.wait_for_timeout(400)
+                if await self._verify_user_category_individual(page):
+                    logger.info("已通过 #userType 选择个人 (label=%s)", label)
+                    return True
+            except Exception:
+                pass
+
+        ok = await page.evaluate(
+            """() => {
+                const sel = document.querySelector('#userType');
+                if (!sel) return false;
+                sel.value = '0';
+                sel.dispatchEvent(new Event('input', { bubbles: true }));
+                sel.dispatchEvent(new Event('change', { bubbles: true }));
+                return sel.value === '0';
+            }"""
+        )
+        if ok and await self._verify_user_category_individual(page):
+            logger.info("JS 已设置 #userType=0 (个人)")
+            return True
+        return False
+
+    async def _check_native_checkbox_by_value(self, page: "Page", value: str) -> bool:
+        cb = page.locator(f"input[type='checkbox'][value='{value}']").first
+        if await cb.count() == 0:
+            return False
+        if await cb.is_checked():
+            return True
+        try:
+            await cb.scroll_into_view_if_needed()
+            await cb.check(force=True)
+            await cb.dispatch_event("change")
+            return await cb.is_checked()
+        except Exception:
+            return bool(
+                await page.evaluate(
+                    """(v) => {
+                        const cb = document.querySelector(`input[type=checkbox][value="${v}"]`);
+                        if (!cb) return false;
+                        cb.checked = true;
+                        cb.dispatchEvent(new Event('input', { bubbles: true }));
+                        cb.dispatchEvent(new Event('change', { bubbles: true }));
+                        return cb.checked;
+                    }""",
+                    value,
+                )
+            )
+
+    async def _select_native_radio_by_value(self, page: "Page", name: str, value: str) -> bool:
+        radio = page.locator(f"input[type='radio'][name='{name}'][value='{value}']").first
+        if await radio.count() == 0:
+            return False
+        if await radio.is_checked():
+            return True
+        try:
+            await radio.scroll_into_view_if_needed()
+            await radio.check(force=True)
+            await radio.dispatch_event("change")
+            return await radio.is_checked()
+        except Exception:
+            return bool(
+                await page.evaluate(
+                    """([n, v]) => {
+                        const r = document.querySelector(`input[type=radio][name="${n}"][value="${v}"]`);
+                        if (!r) return false;
+                        r.checked = true;
+                        r.dispatchEvent(new Event('input', { bubbles: true }));
+                        r.dispatchEvent(new Event('change', { bubbles: true }));
+                        return r.checked;
+                    }""",
+                    [name, value],
+                )
+            )
+
+    async def _fill_native_input(self, page: "Page", selector: str, value: str) -> bool:
+        if not value:
+            return False
+        inp = page.locator(selector).first
+        if await inp.count() == 0:
+            return False
+        try:
+            await inp.scroll_into_view_if_needed()
+            await inp.click()
+            await inp.fill(value)
+            await inp.dispatch_event("input")
+            await inp.dispatch_event("change")
+            actual = await inp.input_value()
+            if actual == value:
+                logger.info("已填写 %s", selector)
+                return True
+        except Exception:
+            pass
+        return bool(
+            await page.evaluate(
+                """([sel, val]) => {
+                    const el = document.querySelector(sel);
+                    if (!el) return false;
+                    const Ctor = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement : HTMLInputElement;
+                    const setter = Object.getOwnPropertyDescriptor(Ctor.prototype, 'value').set;
+                    setter.call(el, val);
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return el.value === val;
+                }""",
+                [selector, value],
+            )
+        )
+
+    async def _wait_for_principal_account_enabled(self, page: "Page", timeout_ms: int = 5000) -> bool:
+        """勾选电子查册后，等待「主要账户」单选可用"""
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const search = document.querySelector('input[type=checkbox][value="search"]');
+                    const principal = document.querySelector(
+                        'input[type=radio][name="serviceType"][value="principal"]'
+                    );
+                    return search && search.checked && principal && !principal.disabled;
+                }""",
+                timeout=timeout_ms,
+            )
+            return True
+        except Exception:
+            return bool(
+                await page.evaluate(
+                    """() => {
+                        const search = document.querySelector('input[type=checkbox][value="search"]');
+                        const principal = document.querySelector(
+                            'input[type=radio][name="serviceType"][value="principal"]'
+                        );
+                        return !!(search && search.checked && principal);
+                    }"""
+                )
+            )
+
+    async def _select_principal_account_after_search(self, page: "Page") -> bool:
+        """先确保勾选电子查册，再选择其下的主要账户"""
+        if not await self._check_native_checkbox_by_value(page, "search"):
+            logger.warning("未能勾选电子查册，无法选择主要账户")
+            return False
+        logger.info("已勾选电子查册 (value=search)")
+        await page.wait_for_timeout(500)
+        await self._wait_for_principal_account_enabled(page)
+
+        for attempt in range(3):
+            if await self._select_native_radio_by_value(page, "serviceType", "principal"):
+                logger.info("已选择主要账户 (serviceType=principal)")
+                return True
+            await page.wait_for_timeout(400)
+        return False
+
+    async def _electronic_submit_confirmed(self, page: "Page") -> bool:
+        """s02：电子提交在 DOM 与 Ant 勾选态均已确认。"""
+        if await self._verify_checkbox_checked(page, r"电子提交|電子提交"):
+            return True
+        status = await self._get_account_profile_status(page)
+        if not status.get("electronicSubmit"):
+            return False
+        # Ant 类名未同步时：原生 filing 在 ant-checkbox-wrapper 内且已 checked
+        return bool(
+            await page.evaluate(
+                """() => {
+                    const inp = document.querySelector('input[type=checkbox][value="filing"]');
+                    if (!inp || !inp.checked) return false;
+                    return !!inp.closest('.ant-checkbox-wrapper') || inp.checked;
+                }"""
+            )
+        )
+
+    async def _ensure_electronic_submit_checked(self, page: "Page") -> bool:
+        """s02：确保「电子提交 / 電子提交」已勾选。"""
+        if await self._electronic_submit_confirmed(page):
+            return True
+
+        if await self._check_native_checkbox_by_value(page, "filing"):
+            logger.info("已勾选电子提交 (native value=filing)")
+            await page.wait_for_timeout(400)
+            if await self._electronic_submit_confirmed(page):
+                return True
+
+        for attempt in range(3):
+            if await self._ensure_checkbox_in_section(
+                page, r"拟订用的服务|擬訂用的服務", r"^电子提交$|^電子提交$"
+            ):
+                await page.wait_for_timeout(400)
+                if await self._electronic_submit_confirmed(page):
+                    return True
+            if await self._ensure_checkbox_by_text(
+                page, r"^电子提交$|^電子提交$", max_text_len=12, prefer_inner=True
+            ):
+                await page.wait_for_timeout(400)
+                if await self._electronic_submit_confirmed(page):
+                    return True
+            await page.wait_for_timeout(500)
+
+        logger.warning("未能勾选「电子提交」")
+        return False
+
+    async def _fill_s02_service_options(self, page: "Page") -> bool:
+        """s02 阶段1：个人 + 电子提交（必选）+ 可选电子查册/主要账户。"""
+        if not await self._select_native_user_type_individual(page):
+            if await self._select_user_category_individual(page):
+                await page.wait_for_timeout(800)
+
+        status = await self._get_account_profile_status(page)
+        if not status.get("userCategory"):
+            if await self._select_user_category_individual(page):
+                await page.wait_for_timeout(800)
+
+        if not await self._ensure_electronic_submit_checked(page):
+            for cb_pat in (r"电子提交|電子提交",):
+                if await self._ensure_checkbox_in_section(
+                    page, r"拟订用的服务|擬訂用的服務", cb_pat
+                ):
+                    await page.wait_for_timeout(400)
+                elif await self._ensure_checkbox_by_text(page, cb_pat):
+                    await page.wait_for_timeout(400)
+            if not await self._ensure_electronic_submit_checked(page):
+                logger.warning("s02 阶段1：电子提交未能勾选")
+                return False
+
+        if not getattr(settings, "icris_skip_esearch_principal", True):
+            for cb_pat in (r"电子查册|電子查冊",):
+                if await self._ensure_checkbox_by_text(page, cb_pat):
+                    await page.wait_for_timeout(400)
+                elif await self._ensure_checkbox_in_section(
+                    page, r"拟订用的服务|擬訂用的服務", cb_pat
+                ):
+                    await page.wait_for_timeout(400)
+            if await self._select_principal_account_after_search(page):
+                await page.wait_for_timeout(400)
+            elif await self._select_primary_account_radio(page):
+                await page.wait_for_timeout(400)
+        else:
+            logger.info(
+                "已跳过电子查冊+主要账户选择 (icris_skip_esearch_principal=True)"
+            )
+
+        ok = await self._electronic_submit_confirmed(page)
+        if ok:
+            logger.info("s02 阶段1完成：电子提交已勾选")
+        return ok
+
+    async def _fill_s02_credentials_fields(
+        self, page: "Page", username: str, password: str
+    ) -> int:
+        """s02 阶段2：仅填用户名/密码/确认密码。"""
+        filled = 0
+        for selector, value in (
+            ("#userId", username),
+            ("#password", password),
+            ("#confirm", password),
+        ):
+            if await self._fill_native_input(page, selector, value):
+                filled += 1
+
+        status = await self._get_account_profile_status(page)
+        need_ant = (
+            not status.get("username")
+            or not status.get("password")
+            or not status.get("confirmPassword")
+        )
+        if need_ant:
+            logger.info(
+                "s02 阶段2：原生凭证不足 (status=%s)，尝试 Ant 回退",
+                status,
+            )
+            field_map = [
+                (r"用户名称|用戶名稱|Username|userName|loginName", username),
+                (r"密码|密碼|Password", password),
+                (r"确认密码|確認密碼|confirmPassword|rePassword|Confirm", password),
+            ]
+            for label_pat, value in field_map:
+                if await self._fill_ant_form_by_label(page, label_pat, value):
+                    filled += 1
+                elif await self._fill_input_near_label(page, [label_pat], value):
+                    filled += 1
+                elif await self._fill_field(page, [label_pat], value):
+                    filled += 1
+
+            for selector, value in (
+                ("#userId", username),
+                ("#password", password),
+                ("#confirm", password),
+            ):
+                if await self._fill_native_input(page, selector, value):
+                    filled += 1
+
+        logger.info("s02 阶段2完成：已填用户名/密码 (filled=%d)", filled)
+        return filled
+
+    async def _fill_account_profile_native(self, page: "Page", data: dict[str, Any]) -> int:
+        """按 s02 页面真实 DOM：先服务选项，再凭证（兼容旧调用）。"""
+        username, password = derive_icris_credentials(data)
+        logger.info("注册用户名 (initials+id+yt): %s", username)
+        if not await self._fill_s02_service_options(page):
+            return 0
+        return await self._fill_s02_credentials_fields(page, username, password)
+
+    async def _log_user_category_dom(self, page: "Page") -> None:
+        info = await page.evaluate(
+            """() => {
+                const items = [...document.querySelectorAll('.ant-form-item')].slice(0, 8).map(item => {
+                    const lbl = item.querySelector('.ant-form-item-label, label');
+                    const sel = item.querySelector('.ant-select');
+                    return {
+                        label: lbl ? (lbl.innerText || '').trim() : '',
+                        hasSelect: !!sel,
+                        selectText: sel ? (sel.innerText || '').trim().slice(0, 80) : '',
+                        classes: sel ? sel.className : '',
+                    };
+                });
+                const opts = [...document.querySelectorAll(
+                    '.ant-select-item-option, .ant-select-item, [role="option"]'
+                )].map(o => (o.innerText || '').trim()).filter(Boolean).slice(0, 15);
+                return { items, visibleOptions: opts };
+            }"""
+        )
+        logger.warning("用户类别 DOM 诊断: %s", info)
+
+    async def _verify_dropdown_selected(
+        self, page: "Page", label_pattern: str, option_pattern: str
+    ) -> bool:
+        if re.search(r"用户类别|用戶類別", label_pattern, re.I) and re.search(
+            r"个人|個人", option_pattern, re.I
+        ):
+            return await self._verify_user_category_individual(page)
+
+        section = await self._get_ant_form_item_by_label(page, label_pattern)
+        opt_re = re.compile(option_pattern, re.I)
+        select = section.locator(".ant-select, .ant-select-selector").first
+        if await select.count() > 0:
+            txt = (await select.inner_text()).strip()
+            if opt_re.search(txt) and not re.search(
+                r"^用户类别$|^用戶類別$", self._normalize_form_label(txt), re.I
+            ):
+                return True
+        for sel in (
+            ".ant-select-selection-item",
+            ".ant-select-selection-item-content",
+            ".ant-select-selection-selected-value",
+            ".ant-select-selection__rendered",
+        ):
+            loc = section.locator(sel)
+            if await loc.count() > 0:
+                txt = (await loc.first.inner_text()).strip()
+                if opt_re.search(txt):
+                    return True
+        return False
+
+    async def _click_visible_select_option(
+        self, page: "Page", option_pattern: str
+    ) -> bool:
+        """点击当前可见下拉列表中的选项"""
+        opt_re = re.compile(option_pattern, re.I)
+        dropdown_selectors = [
+            ".ant-select-dropdown:not(.ant-select-dropdown-hidden)",
+            ".rc-select-dropdown:not(.rc-select-dropdown-hidden)",
+            "[class*='select-dropdown']:not([class*='hidden'])",
+        ]
+        for dd_sel in dropdown_selectors:
+            dropdown = page.locator(dd_sel).last
+            if await dropdown.count() == 0:
+                continue
+            option_selectors = [
+                ".ant-select-item-option",
+                ".ant-select-item",
+                ".rc-select-item-option",
+                "[role='option']",
+                "li",
+            ]
+            for opt_sel in option_selectors:
+                options = dropdown.locator(opt_sel)
+                for i in range(await options.count()):
+                    opt = options.nth(i)
+                    if not await opt.is_visible():
+                        continue
+                    txt = (await opt.inner_text()).strip()
+                    if not opt_re.search(txt):
+                        continue
+                    try:
+                        content = opt.locator(
+                            ".ant-select-item-option-content, .rc-select-item-option-content"
+                        ).first
+                        target = content if await content.count() > 0 else opt
+                        await target.scroll_into_view_if_needed()
+                        await target.click(force=True, timeout=3000)
+                        await page.wait_for_timeout(500)
+                        return True
+                    except Exception:
+                        try:
+                            await opt.click(force=True, timeout=3000)
+                            await page.wait_for_timeout(500)
+                            return True
+                        except Exception:
+                            continue
+        return False
+
+    async def _click_first_visible_select_option(self, page: "Page") -> bool:
+        """点击当前可见下拉列表中的第一项（跳过「请选择」等占位项）"""
+        skip_re = re.compile(r"^请选择$|^請選擇$|^select$", re.I)
+        dropdown_selectors = [
+            ".ant-select-dropdown:not(.ant-select-dropdown-hidden)",
+            ".rc-select-dropdown:not(.rc-select-dropdown-hidden)",
+            "[class*='select-dropdown']:not([class*='hidden'])",
+        ]
+        for dd_sel in dropdown_selectors:
+            dropdown = page.locator(dd_sel).last
+            if await dropdown.count() == 0:
+                continue
+            option_selectors = [
+                ".ant-select-item-option:not(.ant-select-item-option-disabled)",
+                ".ant-select-item:not(.ant-select-item-disabled)",
+                ".rc-select-item-option:not(.rc-select-item-option-disabled)",
+                "[role='option']",
+                "li",
+            ]
+            for opt_sel in option_selectors:
+                options = dropdown.locator(opt_sel)
+                for i in range(await options.count()):
+                    opt = options.nth(i)
+                    if not await opt.is_visible():
+                        continue
+                    txt = (await opt.inner_text()).strip()
+                    if not txt or skip_re.search(txt):
+                        continue
+                    try:
+                        content = opt.locator(
+                            ".ant-select-item-option-content, .rc-select-item-option-content"
+                        ).first
+                        target = content if await content.count() > 0 else opt
+                        await target.scroll_into_view_if_needed()
+                        await target.click(force=True, timeout=3000)
+                        await page.wait_for_timeout(500)
+                        logger.info("已选择下拉首项: %s", txt[:40])
+                        return True
+                    except Exception:
+                        try:
+                            await opt.click(force=True, timeout=3000)
+                            await page.wait_for_timeout(500)
+                            logger.info("已选择下拉首项: %s", txt[:40])
+                            return True
+                        except Exception:
+                            continue
+        return False
+
+    async def _select_ant_dropdown_first_option_by_label(
+        self,
+        page: "Page",
+        label_pattern: str,
+    ) -> bool:
+        """Ant Design Select：按表单项标签打开下拉并选择第一项"""
+        for attempt in range(3):
+            if not await self._open_labeled_select(page, label_pattern):
+                await page.wait_for_timeout(400)
+                continue
+            await page.wait_for_timeout(700)
+            try:
+                await page.wait_for_selector(
+                    ".ant-select-dropdown:not(.ant-select-dropdown-hidden), "
+                    ".rc-select-dropdown:not(.rc-select-dropdown-hidden)",
+                    timeout=4000,
+                )
+            except Exception:
+                pass
+            if await self._click_first_visible_select_option(page):
+                logger.info("已选择下拉首项 [%s]", label_pattern)
+                return True
+            try:
+                await page.keyboard.press("ArrowDown")
+                await page.wait_for_timeout(200)
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(500)
+                section = await self._get_ant_form_item_by_label(page, label_pattern)
+                selected = section.locator(".ant-select-selection-item").first
+                if await selected.count() > 0:
+                    txt = (await selected.inner_text()).strip()
+                    if txt and not re.search(r"请选择|請選擇", txt):
+                        logger.info("键盘已选择下拉首项 [%s] → %s", label_pattern, txt[:40])
+                        return True
+            except Exception:
+                pass
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(300)
+        return False
+
+    async def _open_labeled_select(self, page: "Page", label_pattern: str) -> bool:
+        section = await self._get_ant_form_item_by_label(page, label_pattern)
+        triggers = [
+            section.locator(".ant-select-arrow").first,
+            section.locator(".ant-select-selector").first,
+            section.locator(".ant-select").first,
+            section.locator("[role='combobox']").first,
+        ]
+        for trigger in triggers:
+            if await trigger.count() == 0 or not await trigger.is_visible():
+                continue
+            try:
+                await trigger.scroll_into_view_if_needed()
+                await trigger.click(force=True, timeout=5000)
+                return True
+            except Exception:
+                continue
+
+        return bool(
+            await page.evaluate(
+                """(labelPat) => {
+                    const labelRe = new RegExp(labelPat, 'i');
+                    const norm = s => (s || '').replace(/[\\s:*：]/g, '');
+                    const items = [...document.querySelectorAll('.ant-form-item')];
+                    const item = items.find(el => {
+                        const lbl = el.querySelector('.ant-form-item-label, label');
+                        return lbl && (labelRe.test(lbl.innerText || '') || labelRe.test(norm(lbl.innerText)));
+                    });
+                    const scope = item || document.body;
+                    const select = scope.querySelector('.ant-select');
+                    if (!select) return false;
+                    const trigger = select.querySelector('.ant-select-arrow, .ant-select-selector') || select;
+                    trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                    trigger.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+                    trigger.click();
+                    return true;
+                }""",
+                label_pattern,
+            )
+        )
+
+    async def _select_ant_dropdown_by_label(
+        self,
+        page: "Page",
+        label_pattern: str,
+        option_pattern: str,
+    ) -> bool:
+        """Ant Design Select：按表单项标签打开下拉并选择选项（如 用户类别 → 个人）"""
+        if await self._verify_dropdown_selected(page, label_pattern, option_pattern):
+            logger.info("下拉已选 [%s] → %s", label_pattern, option_pattern)
+            return True
+
+        opt_re = re.compile(option_pattern, re.I)
+
+        # 策略 1：get_by_label + role=option
+        try:
+            label_re = re.compile(label_pattern, re.I)
+            form_item = page.locator(".ant-form-item").filter(
+                has=page.locator(".ant-form-item-label, label").filter(has_text=label_re)
+            ).first
+            if await form_item.count() > 0:
+                combo = form_item.locator("[role='combobox'], .ant-select-selector, .ant-select").first
+                await combo.scroll_into_view_if_needed()
+                await combo.click(force=True, timeout=5000)
+                await page.wait_for_timeout(700)
+                role_opt = page.get_by_role("option", name=opt_re)
+                if await role_opt.count() > 0:
+                    await role_opt.first.click(force=True, timeout=3000)
+                    await page.wait_for_timeout(500)
+                    if await self._verify_dropdown_selected(page, label_pattern, option_pattern):
+                        logger.info("role 已选择下拉 [%s] → %s", label_pattern, option_pattern)
+                        return True
+        except Exception as exc:
+            logger.debug("role 下拉选择失败: %s", exc)
+
+        # 策略 2：打开下拉 + 点击可见选项
+        for attempt in range(3):
+            if not await self._open_labeled_select(page, label_pattern):
+                await page.wait_for_timeout(400)
+                continue
+            await page.wait_for_timeout(700)
+            try:
+                await page.wait_for_selector(
+                    ".ant-select-dropdown:not(.ant-select-dropdown-hidden), "
+                    ".rc-select-dropdown:not(.rc-select-dropdown-hidden)",
+                    timeout=4000,
+                )
+            except Exception:
+                pass
+            if await self._click_visible_select_option(page, option_pattern):
+                if await self._verify_dropdown_selected(page, label_pattern, option_pattern):
+                    logger.info("已选择下拉 [%s] → %s", label_pattern, option_pattern)
+                    return True
+            # 策略 2b：输入关键字筛选（如 香港仔 / English）
+            search = re.sub(r"[\^$()\[\]]", "", option_pattern.split("|")[0])
+            if search and len(search) <= 24:
+                try:
+                    await page.keyboard.type(search, delay=60)
+                    await page.wait_for_timeout(600)
+                    if await self._click_visible_select_option(page, option_pattern):
+                        if await self._verify_dropdown_selected(
+                            page, label_pattern, option_pattern
+                        ):
+                            logger.info(
+                                "搜索已选择下拉 [%s] → %s", label_pattern, option_pattern
+                            )
+                            return True
+                    await page.keyboard.press("Enter")
+                    await page.wait_for_timeout(500)
+                    if await self._verify_dropdown_selected(
+                        page, label_pattern, option_pattern
+                    ):
+                        logger.info(
+                            "Enter 已选择下拉 [%s] → %s", label_pattern, option_pattern
+                        )
+                        return True
+                except Exception as exc:
+                    logger.debug("搜索下拉选择失败: %s", exc)
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(300)
+
+        # 策略 3：键盘选择（个人通常是第一项）
+        try:
+            section = await self._get_ant_form_item_by_label(page, label_pattern)
+            combo = section.locator(".ant-select-selector, .ant-select, [role='combobox']").first
+            if await combo.count() > 0:
+                await combo.click(force=True)
+                await page.wait_for_timeout(500)
+                await page.keyboard.press("ArrowDown")
+                await page.wait_for_timeout(200)
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(500)
+                if await self._verify_dropdown_selected(page, label_pattern, option_pattern):
+                    logger.info("键盘已选择下拉 [%s] → %s", label_pattern, option_pattern)
+                    return True
+        except Exception as exc:
+            logger.debug("键盘下拉选择失败: %s", exc)
+
+        # 策略 4：JS 一次性打开并点击
+        ok = await page.evaluate(
+            """([labelPat, optPat]) => {
+                const labelRe = new RegExp(labelPat, 'i');
+                const optRe = new RegExp(optPat, 'i');
+                const norm = s => (s || '').replace(/[\\s:*：]/g, '');
+                const isPlaceholder = t => /^用户类别$|^用戶類別$/i.test(norm(t));
+
+                const items = [...document.querySelectorAll('.ant-form-item')];
+                let item = items.find(el => {
+                    const lbl = el.querySelector('.ant-form-item-label, label');
+                    return lbl && (labelRe.test(lbl.innerText || '') || labelRe.test(norm(lbl.innerText)));
+                });
+                if (!item) item = items.find(el => el.querySelector('.ant-select'));
+
+                const select = item ? item.querySelector('.ant-select') : document.querySelector('.ant-select');
+                if (!select) return false;
+
+                const trigger = select.querySelector('.ant-select-selector, .ant-select-arrow') || select;
+                trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                trigger.click();
+
+                const dropdowns = [...document.querySelectorAll('.ant-select-dropdown, .rc-select-dropdown')]
+                    .filter(d => !d.classList.contains('ant-select-dropdown-hidden')
+                        && !d.classList.contains('rc-select-dropdown-hidden'));
+                const dd = dropdowns[dropdowns.length - 1];
+                if (!dd) return false;
+
+                const opts = [...dd.querySelectorAll(
+                    '.ant-select-item-option, .ant-select-item, .rc-select-item-option, [role="option"]'
+                )];
+                for (const o of opts) {
+                    const content = o.querySelector('.ant-select-item-option-content') || o;
+                    const txt = (content.innerText || o.innerText || '').trim();
+                    if (!optRe.test(txt) || isPlaceholder(txt)) continue;
+                    content.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                    content.click();
+                    o.click();
+                    return true;
+                }
+                if (opts[0]) {
+                    opts[0].click();
+                    return true;
+                }
+                return false;
+            }""",
+            [label_pattern, option_pattern],
+        )
+        if ok:
+            await page.wait_for_timeout(600)
+            if await self._verify_dropdown_selected(page, label_pattern, option_pattern):
+                logger.info("JS 已选择下拉 [%s] → %s", label_pattern, option_pattern)
+                return True
+
+        await self._log_user_category_dom(page)
+        logger.warning("未能选择下拉 [%s] → %s", label_pattern, option_pattern)
+        return False
+
+    async def _verify_checkbox_checked(
+        self, page: "Page", text_pattern: str, *, scope=None
+    ) -> bool:
+        pattern = re.compile(text_pattern, re.I)
+        root = scope if scope is not None else page
+        checked = root.locator(
+            ".ant-checkbox-wrapper-checked, .ant-checkbox-checked"
+        ).filter(has_text=pattern)
+        return await checked.count() > 0
+
+    async def _ensure_checkbox_in_section(
+        self,
+        page: "Page",
+        section_label: str,
+        checkbox_pattern: str,
+    ) -> bool:
+        """在指定区域内勾选复选框（如 拟订用的服务 → 电子提交）"""
+        section = await self._get_labeled_section(page, section_label)
+        cb_re = re.compile(checkbox_pattern, re.I)
+
+        if await self._verify_checkbox_checked(page, checkbox_pattern, scope=section):
+            logger.info("已勾选 [%s] %s", section_label, checkbox_pattern)
+            return True
+
+        wrappers = section.locator(".ant-checkbox-wrapper").filter(has_text=cb_re)
+        for i in range(await wrappers.count()):
+            item = wrappers.nth(i)
+            if not await item.is_visible():
+                continue
+            txt = (await item.inner_text()).strip()
+            if not cb_re.search(txt) or len(txt) > 30:
+                continue
+            try:
+                await item.scroll_into_view_if_needed()
+                await item.click(timeout=3000)
+                await page.wait_for_timeout(400)
+                if await self._verify_checkbox_checked(page, checkbox_pattern, scope=section):
+                    logger.info("已勾选 [%s] → %s", section_label, checkbox_pattern)
+                    return True
+            except Exception:
+                pass
+            inp = item.locator("input[type='checkbox']").first
+            if await inp.count() > 0:
+                try:
+                    await inp.check(force=True)
+                    await inp.dispatch_event("change")
+                    await page.wait_for_timeout(400)
+                    if await self._verify_checkbox_checked(
+                        page, checkbox_pattern, scope=section
+                    ):
+                        logger.info("已 force 勾选 [%s] → %s", section_label, checkbox_pattern)
+                        return True
+                except Exception:
+                    pass
+
+        ok = await page.evaluate(
+            """([sectionLabel, cbText]) => {
+                const secRe = new RegExp(sectionLabel, 'i');
+                const cbRe = new RegExp(cbText, 'i');
+                const blocks = [...document.querySelectorAll('.ant-form-item, fieldset, .form-group')];
+                const section = blocks.find(el => secRe.test(el.innerText || ''));
+                const scope = section || document.body;
+                const boxes = [...scope.querySelectorAll('.ant-checkbox-wrapper')];
+                for (const w of boxes) {
+                    const t = (w.innerText || '').trim();
+                    if (!cbRe.test(t) || t.length > 30) continue;
+                    w.click();
+                    const inp = w.querySelector("input[type='checkbox']");
+                    if (inp) {
+                        inp.checked = true;
+                        inp.dispatchEvent(new Event('input', { bubbles: true }));
+                        inp.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                    if (w.classList.contains('ant-checkbox-wrapper-checked')) return true;
+                }
+                return false;
+            }""",
+            [section_label, checkbox_pattern],
+        )
+        if ok:
+            logger.info("JS 已勾选 [%s] → %s", section_label, checkbox_pattern)
+            return True
+        logger.warning("未能勾选 [%s] → %s", section_label, checkbox_pattern)
+        return False
+
+    async def _verify_option_selected(
+        self,
+        page: "Page",
+        text_pattern: str,
+        *,
+        option_type: str = "radio",
+    ) -> bool:
+        pattern = re.compile(text_pattern, re.I)
+        if option_type == "radio":
+            checked = page.locator(".ant-radio-wrapper-checked, .ant-radio-checked").filter(
+                has_text=pattern
+            )
+            if await checked.count() > 0:
+                return True
+            inp = page.locator("input[type='radio']:checked")
+            for i in range(await inp.count()):
+                el = inp.nth(i)
+                wrapper = el.locator(
+                    "xpath=ancestor::label[contains(@class,'radio')]"
+                    " | ancestor::*[contains(@class,'ant-radio-wrapper')][1]"
+                )
+                if await wrapper.count() > 0:
+                    try:
+                        txt = await wrapper.first.inner_text(timeout=_S04_LOCATOR_MS)
+                    except Exception:
+                        continue
+                    if pattern.search(txt):
+                        return True
+        else:
+            checked = page.locator(
+                ".ant-checkbox-wrapper-checked, .ant-checkbox-checked"
+            ).filter(has_text=pattern)
+            if await checked.count() > 0:
+                return True
+        return False
+
+    async def _get_labeled_section(self, page: "Page", label_pattern: str):
+        """定位包含指定标签文字的表单项区域"""
+        regex = re.compile(label_pattern, re.I)
+        selectors = [
+            ".ant-form-item",
+            ".ant-row.ant-form-item",
+            ".form-group",
+            "tr",
+            "fieldset",
+            "div.section",
+        ]
+        for sel in selectors:
+            items = page.locator(sel).filter(has_text=regex)
+            try:
+                n = await items.count()
+            except Exception:
+                continue
+            for i in range(n):
+                item = items.nth(i)
+                try:
+                    if not await item.is_visible():
+                        continue
+                    txt = await item.inner_text(timeout=_S04_LOCATOR_MS)
+                except Exception:
+                    continue
+                if regex.search(txt) and len(txt) < 800:
+                    return item
+        return page.locator("form, body").first
+
+    async def _select_radio_in_section(
+        self,
+        page: "Page",
+        section_label: str,
+        option_pattern: str,
+    ) -> bool:
+        """在指定标签区域内选择单选项（如：用户类别 → 个人）"""
+        section = await self._get_labeled_section(page, section_label)
+        opt_re = re.compile(option_pattern, re.I)
+
+        if await self._verify_option_selected(page, option_pattern, option_type="radio"):
+            logger.info("已选中 [%s] %s（无需重复点击）", section_label, option_pattern)
+            return True
+
+        candidates = [
+            section.locator(".ant-radio-wrapper").filter(has_text=opt_re),
+            section.locator("label.ant-radio-wrapper").filter(has_text=opt_re),
+            section.locator("label").filter(has_text=opt_re),
+            section.get_by_role("radio", name=opt_re),
+        ]
+
+        for loc in candidates:
+            try:
+                n = await loc.count()
+            except Exception:
+                continue
+            for i in range(n):
+                item = loc.nth(i)
+                try:
+                    if not await item.is_visible():
+                        continue
+                    txt = (await item.inner_text(timeout=_S04_LOCATOR_MS)).strip()
+                except Exception:
+                    continue
+                if re.search(r"机构|機構|团体|團體|法人|公司|组织|組織", txt, re.I):
+                    continue
+                try:
+                    await item.scroll_into_view_if_needed(timeout=_S04_LOCATOR_MS)
+                    await item.click(timeout=_S04_LOCATOR_MS)
+                    await page.wait_for_timeout(400)
+                    if await self._verify_option_selected(page, option_pattern, option_type="radio"):
+                        logger.info("已选择 [%s] → %s", section_label, option_pattern)
+                        return True
+                except Exception:
+                    pass
+
+                # Ant Design 隐藏 input，force check
+                inp = item.locator("input[type='radio']").first
+                try:
+                    has_inp = await inp.count() > 0
+                except Exception:
+                    has_inp = False
+                if has_inp:
+                    try:
+                        await inp.check(force=True, timeout=_S04_LOCATOR_MS)
+                        await inp.dispatch_event("change")
+                        await inp.dispatch_event("click")
+                        await page.wait_for_timeout(400)
+                        if await self._verify_option_selected(
+                            page, option_pattern, option_type="radio"
+                        ):
+                            logger.info("已 force 选择 [%s] → %s", section_label, option_pattern)
+                            return True
+                    except Exception:
+                        pass
+
+        # JS 回退：在用户类别区域内点击「个人」
+        try:
+            ok = await self._evaluate_capped(
+                page,
+                """([sectionLabel, optionText]) => {
+                    const root = document.body || document.documentElement;
+                    if (!root) return false;
+                    const secRe = new RegExp(sectionLabel, 'i');
+                    const optRe = new RegExp(optionText, 'i');
+                    const excludeRe = /机构|機構|团体|團體|法人|公司|组织|組織/i;
+                    const blocks = [...root.querySelectorAll(
+                        '.ant-form-item, .ant-row, tr, fieldset, .form-group'
+                    )];
+                    const section = blocks.find(el => secRe.test(el.innerText || ''));
+                    const scope = section || root;
+                    const wrappers = [...scope.querySelectorAll('.ant-radio-wrapper, label')];
+                    for (const w of wrappers) {
+                        const t = (w.innerText || '').trim();
+                        if (!optRe.test(t) || excludeRe.test(t)) continue;
+                        w.click();
+                        const inp = w.querySelector('input[type=radio]') || w.control;
+                        if (inp) {
+                            inp.checked = true;
+                            inp.dispatchEvent(new Event('input', { bubbles: true }));
+                            inp.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        const checked = scope.querySelector(
+                            '.ant-radio-wrapper-checked input[type=radio], input[type=radio]:checked'
+                        );
+                        if (checked) {
+                            const wrap = checked.closest('.ant-radio-wrapper') || checked.parentElement;
+                            return optRe.test((wrap && wrap.innerText) || '');
+                        }
+                    }
+                    return false;
+                }""",
+                [section_label, option_pattern],
+                timeout_ms=_S04_LOCATOR_MS * 2,
+            )
+        except Exception as exc:
+            logger.debug("分区 radio JS 回退失败 [%s]: %s", section_label, exc)
+            ok = False
+        if ok:
+            logger.info("JS 已选择 [%s] → %s", section_label, option_pattern)
+            await page.wait_for_timeout(400)
+            return True
+
+        logger.warning("未能选择 [%s] → %s", section_label, option_pattern)
+        return False
+
+    async def _select_address_type_radio(self, page: "Page", *, is_hk: bool) -> bool:
+        """地址类型：香港→本地地址；否则→非香港地址（全页精确匹配，禁止误点第一项）。"""
+        if is_hk:
+            labels = ("本地地址", "本地位址")
+            pattern = r"本地地址|本地位址"
+            # 避免「非香港地址」被「本地」子串误匹配
+            exclude = re.compile(r"非香港")
+        else:
+            labels = ("非香港地址", "非本地地址")
+            pattern = r"非香港地址|非本地地址"
+            exclude = None
+
+        if await self._verify_option_selected(page, pattern, option_type="radio"):
+            logger.info("地址类型已是目标: %s", pattern)
+            return True
+
+        # 1) Playwright：短文案 radio wrapper
+        wrappers = page.locator(".ant-radio-wrapper, label.ant-radio-wrapper")
+        for i in range(await wrappers.count()):
+            item = wrappers.nth(i)
+            if not await item.is_visible():
+                continue
+            txt = (await item.inner_text()).strip().replace("\n", "")
+            if exclude and exclude.search(txt):
+                continue
+            if not any(lab in txt for lab in labels):
+                continue
+            if len(txt) > 40:
+                continue
+            try:
+                await item.scroll_into_view_if_needed()
+                await item.click(timeout=3000)
+                await page.wait_for_timeout(500)
+                if await self._verify_option_selected(page, pattern, option_type="radio"):
+                    logger.info("已选择地址类型: %s", txt)
+                    return True
+                inp = item.locator("input[type='radio']").first
+                if await inp.count() > 0:
+                    await inp.check(force=True)
+                    await inp.dispatch_event("click")
+                    await inp.dispatch_event("change")
+                    await page.wait_for_timeout(500)
+                    if await self._verify_option_selected(
+                        page, pattern, option_type="radio"
+                    ):
+                        logger.info("已 force 选择地址类型: %s", txt)
+                        return True
+            except Exception as exc:
+                logger.debug("地址类型点击失败 txt=%s: %s", txt[:20], exc)
+
+        # 2) get_by_text / role
+        for lab in labels:
+            try:
+                loc = page.get_by_text(lab, exact=False)
+                for j in range(min(await loc.count(), 5)):
+                    el = loc.nth(j)
+                    if not await el.is_visible():
+                        continue
+                    t = (await el.inner_text()).strip()
+                    if exclude and exclude.search(t):
+                        continue
+                    if lab not in t or len(t) > 40:
+                        continue
+                    await el.scroll_into_view_if_needed()
+                    await el.click(timeout=3000)
+                    await page.wait_for_timeout(500)
+                    if await self._verify_option_selected(
+                        page, pattern, option_type="radio"
+                    ):
+                        logger.info("已点文字选择地址类型: %s", lab)
+                        return True
+            except Exception:
+                pass
+
+        # 3) JS：精确匹配，绝不回退到 radios[0]
+        ok = await page.evaluate(
+            """([labels, wantNonHk]) => {
+                const root = document.body || document.documentElement;
+                if (!root) return false;
+                const labs = labels || [];
+                const wrappers = [...root.querySelectorAll(
+                    '.ant-radio-wrapper, label.ant-radio-wrapper, label'
+                )];
+                const norm = s => (s || '').replace(/\\s+/g, '').trim();
+                for (const w of wrappers) {
+                    const t = norm(w.innerText || '');
+                    if (!t || t.length > 40) continue;
+                    if (wantNonHk) {
+                        if (!t.includes('非香港') && !labs.some(l => t.includes(l))) continue;
+                    } else {
+                        if (t.includes('非香港')) continue;
+                        if (!labs.some(l => t.includes(l))) continue;
+                    }
+                    w.scrollIntoView({ block: 'center' });
+                    const inner = w.querySelector('.ant-radio, .ant-radio-input, span.ant-radio');
+                    if (inner) inner.click();
+                    w.click();
+                    const inp = w.querySelector('input[type=radio]');
+                    if (inp) {
+                        inp.checked = true;
+                        inp.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                        inp.dispatchEvent(new Event('input', { bubbles: true }));
+                        inp.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                    const checked = w.classList.contains('ant-radio-wrapper-checked')
+                        || (inp && inp.checked)
+                        || !!(w.querySelector('.ant-radio-checked'));
+                    if (checked) return true;
+                }
+                return false;
+            }""",
+            [list(labels), (not is_hk)],
+        )
+        await page.wait_for_timeout(500)
+        if ok or await self._verify_option_selected(page, pattern, option_type="radio"):
+            logger.info("JS 已选择地址类型 is_hk=%s", is_hk)
+            return True
+
+        # 4) 通用 section（仅作最后手段；已去掉误点 radios[0]）
+        section_pat = r"地址|住址|Address"
+        opt_pat = pattern
+        if await self._select_radio_in_section(page, section_pat, opt_pat):
+            if await self._verify_option_selected(page, pattern, option_type="radio"):
+                return True
+
+        logger.warning(
+            "未能选择地址类型 is_hk=%s target=%s", is_hk, pattern
+        )
+        return False
+
+    async def _select_user_category_individual(self, page: "Page") -> bool:
+        """用户类别选择「个人」— 优先原生 #userType"""
+        if await self._select_native_user_type_individual(page):
+            return True
+
+        # 回退：Ant Design 下拉（旧版页面）
+        label_pat = r"用户类别|用戶類別"
+        for option_pat in (r"^个人$", r"^個人$", r"个人|個人"):
+            if await self._select_ant_dropdown_by_label(page, label_pat, option_pat):
+                if await self._verify_user_category_individual(page):
+                    return True
+        await self._log_user_category_dom(page)
+        return False
+
+    async def _ensure_checkbox_by_text(
+        self,
+        page: "Page",
+        text_pattern: str,
+        *,
+        max_text_len: int = 40,
+        prefer_inner: bool = False,
+    ) -> bool:
+        """全页按文字勾选复选框（电子提交/电子查册；s03a 长文案可放宽 max_text_len）。"""
+        pattern = re.compile(text_pattern, re.I)
+        if await self._verify_checkbox_checked(page, text_pattern):
+            return True
+        wrappers = page.locator(".ant-checkbox-wrapper").filter(has_text=pattern)
+        for i in range(await wrappers.count()):
+            item = wrappers.nth(i)
+            if not await item.is_visible():
+                continue
+            txt = (await item.inner_text()).strip()
+            if max_text_len > 0 and len(txt) > max_text_len:
+                continue
+            try:
+                await item.scroll_into_view_if_needed()
+                if prefer_inner:
+                    inner = item.locator(".ant-checkbox-inner, .ant-checkbox").first
+                    if await inner.count() > 0:
+                        await inner.click(force=True, timeout=3000)
+                    else:
+                        await item.click(force=True, timeout=3000)
+                else:
+                    await item.click(force=True, timeout=3000)
+                await page.wait_for_timeout(400)
+                if await self._verify_checkbox_checked(page, text_pattern):
+                    logger.info("已勾选复选框: %s", text_pattern)
+                    return True
+            except Exception:
+                pass
+        return await self._click_option_by_text(page, text_pattern, option_type="checkbox")
+
+    async def _select_primary_account_radio(self, page: "Page") -> bool:
+        """选择「主要账户」单选"""
+        if await self._select_native_radio_by_value(page, "serviceType", "principal"):
+            logger.info("已选择主要账户 (serviceType=principal)")
+            return True
+        if await self._verify_option_selected(page, r"主要账户|主要帳戶", option_type="radio"):
+            return True
+        for section in (
+            r"电子查册|電子查冊",
+            r"拟订用的服务|擬訂用的服務",
+            r".*",
+        ):
+            if await self._select_radio_in_section(
+                page, section, r"主要账户|主要帳戶|Primary"
+            ):
+                return True
+        return await self._click_option_by_text(
+            page, r"^主要账户$|^主要帳戶$", option_type="radio"
+        )
+
+    async def _click_option_by_text(
+        self,
+        page: "Page",
+        text_pattern: str,
+        *,
+        option_type: str = "any",
+    ) -> bool:
+        """点击 Ant Design 单选/复选（按可见文字）"""
+        pattern = re.compile(text_pattern, re.I)
+        wrappers = [
+            ".ant-radio-wrapper",
+            ".ant-checkbox-wrapper",
+            "label.ant-radio-wrapper",
+            "label.ant-checkbox-wrapper",
+            "label",
+            "span.ant-radio + span",
+        ]
+        if option_type == "radio":
+            wrappers = wrappers[:2] + ["label"]
+        elif option_type == "checkbox":
+            wrappers = [".ant-checkbox-wrapper", "label.ant-checkbox-wrapper", "label"]
+
+        for sel in wrappers:
+            loc = page.locator(sel).filter(has_text=pattern)
+            count = await loc.count()
+            for i in range(count):
+                item = loc.nth(i)
+                if not await item.is_visible():
+                    continue
+                try:
+                    await item.scroll_into_view_if_needed()
+                    await item.click(timeout=3000)
+                    await page.wait_for_timeout(300)
+                    logger.info("已选择: %s (%s)", text_pattern, sel)
+                    return True
+                except Exception:
+                    continue
+
+        role = "radio" if option_type == "radio" else "checkbox"
+        if option_type in ("radio", "checkbox"):
+            role_loc = page.get_by_role(role, name=pattern)
+            if await role_loc.count() > 0:
+                await role_loc.first.scroll_into_view_if_needed()
+                await role_loc.first.click()
+                logger.info("已选择(role): %s", text_pattern)
+                return True
+
+        text_loc = page.get_by_text(pattern).first
+        if await text_loc.count() > 0 and await text_loc.is_visible():
+            await text_loc.scroll_into_view_if_needed()
+            await text_loc.click()
+            logger.info("已点击文字: %s", text_pattern)
+            return True
+
+        if option_type == "checkbox":
+            ok = await page.evaluate(
+                """(pat) => {
+                    const re = new RegExp(pat, 'i');
+                    const boxes = [...document.querySelectorAll(
+                        '.ant-checkbox-wrapper, label.ant-checkbox-wrapper, label'
+                    )];
+                    for (const w of boxes) {
+                        const t = (w.innerText || '').trim();
+                        if (!re.test(t)) continue;
+                        w.click();
+                        const inp = w.querySelector("input[type='checkbox']");
+                        if (inp) {
+                            inp.checked = true;
+                            inp.dispatchEvent(new Event('input', { bubbles: true }));
+                            inp.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        return true;
+                    }
+                    return false;
+                }""",
+                text_pattern,
+            )
+            if ok:
+                logger.info("JS 已勾选: %s", text_pattern)
+                return True
+        return False
+
+    async def _fill_input_near_label(
+        self,
+        page: "Page",
+        label_patterns: list[str],
+        value: str,
+    ) -> bool:
+        if not value:
+            return False
+
+        scope = page.locator("form").first
+        if await scope.count() == 0:
+            scope = page.locator("body")
+
+        for pattern in label_patterns:
+            regex = re.compile(pattern)
+            labels = scope.locator("label, .ant-form-item-label, .form-label").filter(
+                has_text=regex
+            )
+            for i in range(await labels.count()):
+                lbl = labels.nth(i)
+                if not await lbl.is_visible():
+                    continue
+                lbl_for = await lbl.get_attribute("for")
+                if lbl_for:
+                    inp = page.locator(f"#{lbl_for}")
+                    if await inp.count() > 0:
+                        await inp.fill(value)
+                        logger.info("已填写 [%s]: %s", pattern, value)
+                        return True
+                container = lbl.locator(
+                    "xpath=ancestor::div[contains(@class,'form-item') or "
+                    "contains(@class,'ant-row')][1]"
+                )
+                inp = container.locator(
+                    "input:not([type='checkbox']):not([type='radio']):not([type='hidden']), "
+                    "textarea"
+                ).first
+                if await inp.count() > 0:
+                    await inp.fill(value)
+                    logger.info("已填写 [%s]: %s", pattern, value)
+                    return True
+
+        for pattern in label_patterns:
+            for attr in ("name", "id", "placeholder", "aria-label"):
+                inp = scope.locator(
+                    f"input[{attr}*='{pattern}' i]:not([type='checkbox']):not([type='radio'])"
+                )
+                if await inp.count() > 0:
+                    await inp.first.fill(value)
+                    logger.info("已填写 input[%s]: %s", attr, value)
+                    return True
+        return False
+
+    async def _fill_user_profile_step(self, page: "Page", data: dict[str, Any]) -> int:
+        """
+        填写账户资料：
+        用户类别=个人 → 电子提交/电子查册 → 主要账户 → 用户名称/密码
+        """
+        if not await self._is_account_profile_step(page):
+            await self._recover_step_or_restart(
+                page, self._is_account_profile_step, label="s02账户资料"
+            )
+
+        await self._scroll_registration_form_into_view(page)
+        await self._wait_registration_vue(page, timeout=_STEP_READY_MS)
+        await self._recover_step_or_restart(
+            page, self._account_form_is_ready, label="s02账户表单"
+        )
+        await page.wait_for_timeout(_FORM_PAUSE_MS)
+        await self._dismiss_cookie_banner(page)
+
+        filled = 0
+        username, password = derive_icris_credentials(data)
+        logger.info("开始填写账户资料 (url=%s)", page.url)
+        await self._log_account_profile_status(page, prefix="填写前 ")
+
+        # 阶段1：个人 + 电子提交（未勾选则不填凭证、不继续）
+        if not await self._fill_s02_service_options(page):
+            logger.warning("s02 电子提交未勾选，跳过填写用户名/密码与继续")
+            return 0
+
+        # 阶段2：用户名 / 密码 / 确认密码
+        filled = await self._fill_s02_credentials_fields(page, username, password)
+        status = await self._get_account_profile_status(page)
+        individual_ok = status.get("userCategory", False)
+
+        if filled == 0:
+            form_labels = await page.evaluate(
+                """() => [...document.querySelectorAll(
+                    '.ant-form-item-label, label, .ant-select-selection-placeholder'
+                )].map(e => (e.innerText || '').trim()).filter(t => t && t.length < 40).slice(0, 30)"""
+            )
+            logger.warning("账户资料未填写任何字段，页面标签: %s", form_labels)
+        logger.info(
+            "账户资料已填写 %d 项 (用户名=%s, 个人已选=%s, 状态=%s, url=%s)",
+            filled,
+            username,
+            individual_ok,
+            status,
+            page.url[:100],
+        )
+
+        if not _s02_password_meets_rules(password):
+            logger.warning("s02 密码不合规，尝试修正后重填")
+            username, password = finalize_s02_icris_credentials(data, username, password)
+            filled += await self._fill_s02_credentials_fields(page, username, password)
+            status = await self._get_account_profile_status(page)
+
+        password_ok = _s02_password_meets_rules(password)
+        electronic_ok = await self._ensure_electronic_submit_checked(page)
+        if not electronic_ok:
+            logger.warning("s02 继续前电子提交仍未勾选，不点继续")
+            return filled
+
+        status = await self._get_account_profile_status(page)
+        if (
+            filled > 0
+            and password_ok
+            and status.get("userCategory")
+            and status.get("electronicSubmit")
+            and status.get("username")
+            and status.get("password")
+            and status.get("confirmPassword")
+        ):
+            self._persist_s02_account_to_job(data)
+            if await self._click_account_profile_continue(page):
+                await self._log_page(page, "账户资料继续后")
+            else:
+                logger.warning("账户资料填写后未能点击「继续」")
+                await self._retry_s02_if_username_taken(page, data)
+        elif filled > 0:
+            if not password_ok:
+                logger.warning("s02 密码仍不合规，跳过点击继续: %s", password[:20])
+            elif not status.get("electronicSubmit"):
+                logger.warning("s02 电子提交未勾选，跳过点击继续: %s", status)
+            else:
+                logger.warning("账户资料未完整，跳过点击继续: %s", status)
+
+        return filled
+
+    async def _fill_field(self, page: "Page", keywords: list[str], value: str) -> bool:
+        if not value:
+            return False
+
+        scope = page.locator("form[action*='registration' i], form").first
+
+        for kw in keywords:
+            labels = scope.locator(f"label:has-text('{kw}')")
+            lbl_count = await labels.count()
+            for i in range(lbl_count):
+                lbl = labels.nth(i)
+                lbl_for = await lbl.get_attribute("for")
+                if lbl_for:
+                    inp = scope.locator(f"#{lbl_for}")
+                    if await inp.count() > 0:
+                        if await inp.is_disabled():
+                            continue
+                        await inp.fill(value)
+                        return True
+                inp = lbl.locator("xpath=following::input[1] | following::textarea[1]")
+                if await inp.count() > 0:
+                    if await inp.first.is_disabled():
+                        continue
+                    await inp.first.fill(value)
+                    return True
+
+        for kw in keywords:
+            for attr in ("name", "id", "placeholder"):
+                inp = scope.locator(f"input[{attr}*='{kw}' i], textarea[{attr}*='{kw}' i]")
+                if await inp.count() > 0:
+                    await inp.first.fill(value)
+                    return True
+
+        return False
+
+    def _is_s02_url(self, url: str) -> bool:
+        return bool(re.search(r"registration/s02", (url or "").lower()))
+
+    def _is_s03_user_info_url(self, url: str) -> bool:
+        """s03 用户资料页。不含 s03a 条款页。"""
+        return bool(re.search(r"registration/s03(?!a)", (url or "").lower()))
+
+    def _is_user_info_url(self, url: str) -> bool:
+        return bool(re.search(r"registration/s03", url.lower()))
+
+    async def _is_user_info_step(self, page: "Page") -> bool:
+        if self._is_user_info_url(page.url):
+            return True
+        return bool(
+            await page.evaluate(
+                """() => /填写用户资料|填寫用戶資料|步骤2\\s*-\\s*填写用户资料/.test(
+                    document.body ? document.body.innerText : ''
+                )"""
+            )
+        )
+
+    async def _user_info_form_is_ready(self, page: "Page") -> bool:
+        """非阻塞：用户资料表单是否可填。"""
+        try:
+            return bool(
+                await page.evaluate(
+                    """() => {
+                        const t = document.body ? document.body.innerText : '';
+                        if (!/填写用户资料|填寫用戶資料/.test(t)) return false;
+                        const inputs = document.querySelectorAll(
+                            "input:not([disabled]):not([type='hidden'])"
+                        );
+                        const selects = document.querySelectorAll(
+                            '.ant-select, [role=combobox], select:not([disabled])'
+                        );
+                        return inputs.length >= 2 || selects.length >= 1;
+                    }"""
+                )
+            )
+        except Exception:
+            return False
+
+    async def _wait_for_user_info_form(self, page: "Page", timeout_ms: int = 90000) -> bool:
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const t = document.body ? document.body.innerText : '';
+                    if (!/填写用户资料|填寫用戶資料/.test(t)) return false;
+                    const inputs = document.querySelectorAll(
+                        "input:not([disabled]):not([type='hidden'])"
+                    );
+                    const selects = document.querySelectorAll(
+                        '.ant-select, [role=combobox], select:not([disabled])'
+                    );
+                    return inputs.length >= 2 || selects.length >= 1;
+                }""",
+                timeout=timeout_ms,
+            )
+            await page.wait_for_timeout(_FORM_PAUSE_MS)
+            return True
+        except Exception:
+            return await self._user_info_form_is_ready(page)
+
+    async def _fill_enabled_field_by_label(
+        self,
+        page: "Page",
+        label_pattern: str,
+        value: str,
+        *,
+        field_type: str = "text",
+    ) -> bool:
+        """按标签填写可用字段（跳过 disabled，兼容 Vue）"""
+        if not value:
+            return False
+        ok = await page.evaluate(
+            """([labelPat, val, ftype]) => {
+                const labelRe = new RegExp(labelPat, 'i');
+                const setNativeValue = (el, v) => {
+                    const Ctor = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement : HTMLInputElement;
+                    const setter = Object.getOwnPropertyDescriptor(Ctor.prototype, 'value').set;
+                    setter.call(el, v);
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                };
+                const blocks = document.querySelectorAll(
+                    '.ant-form-item, fieldset, .form-group, tr, .content'
+                );
+                for (const item of blocks) {
+                    const label = item.querySelector(
+                        'label, .ant-form-item-label, .rowTitle, th, .control-label'
+                    );
+                    const labelText = label ? (label.innerText || '').trim() : '';
+                    if (!labelText || !labelRe.test(labelText)) continue;
+                    if (ftype === 'select') {
+                        const sel = item.querySelector('select:not([disabled])');
+                        if (!sel) continue;
+                        const opt = [...sel.options].find(o =>
+                            new RegExp(val, 'i').test((o.textContent || '').trim()) || o.value === val
+                        );
+                        if (opt) {
+                            sel.value = opt.value;
+                            sel.dispatchEvent(new Event('change', { bubbles: true }));
+                            return true;
+                        }
+                        continue;
+                    }
+                    const inp = item.querySelector(
+                        "input:not([disabled]):not([type='checkbox']):not([type='radio']):not([type='hidden']), "
+                        + "textarea:not([disabled])"
+                    );
+                    if (!inp) continue;
+                    inp.focus();
+                    setNativeValue(inp, val);
+                    return true;
+                }
+                return false;
+            }""",
+            [label_pattern, value, field_type],
+        )
+        if ok:
+            logger.info("已填写用户资料 [%s]", label_pattern)
+        return bool(ok)
+
+    async def _fill_by_placeholder(
+        self,
+        page: "Page",
+        placeholder_pattern: str,
+        value: str,
+        *,
+        index: int = 0,
+    ) -> bool:
+        """按 input placeholder 填写（s03 Vue 表单常用 placeholder 作标签）"""
+        if not value:
+            return False
+        ph_re = re.compile(placeholder_pattern, re.I)
+        try:
+            inputs = page.locator(
+                "input.ant-input:not([disabled]), "
+                "textarea.ant-input:not([disabled]), "
+                "input:not([disabled]):not([type='hidden']):not([type='checkbox']):not([type='radio'])"
+            )
+            matches: list[Any] = []
+            for i in range(await inputs.count()):
+                item = inputs.nth(i)
+                ph = (await item.get_attribute("placeholder") or "").strip()
+                aria = (await item.get_attribute("aria-label") or "").strip()
+                if ph_re.search(ph) or ph_re.search(aria):
+                    matches.append(item)
+            if len(matches) > index:
+                target = matches[index]
+                await target.scroll_into_view_if_needed()
+                await target.fill(value)
+                await target.dispatch_event("input")
+                await target.dispatch_event("change")
+                logger.info("已按 placeholder 填写 [%s]", placeholder_pattern)
+                return True
+        except Exception as exc:
+            logger.debug("placeholder fill failed: %s", exc)
+
+        ok = await page.evaluate(
+            """([pat, val, idx]) => {
+                const phRe = new RegExp(pat, 'i');
+                const setNativeValue = (el, v) => {
+                    const Ctor = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement : HTMLInputElement;
+                    const setter = Object.getOwnPropertyDescriptor(Ctor.prototype, 'value').set;
+                    setter.call(el, v);
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                };
+                const inputs = [...document.querySelectorAll(
+                    "input:not([disabled]):not([type='hidden']):not([type='checkbox']):not([type='radio']), "
+                    + "textarea:not([disabled])"
+                )].filter(inp => {
+                    const ph = inp.placeholder || inp.getAttribute('aria-label') || '';
+                    return phRe.test(ph);
+                });
+                if (inputs.length <= idx) return false;
+                const inp = inputs[idx];
+                inp.focus();
+                setNativeValue(inp, val);
+                return true;
+            }""",
+            [placeholder_pattern, value, index],
+        )
+        if ok:
+            logger.info("已按 placeholder(JS) 填写 [%s]", placeholder_pattern)
+        return bool(ok)
+
+    async def _fill_user_info_step(self, page: "Page", data: dict[str, Any]) -> int:
+        """填写用户资料（s03）：称谓/姓名/地址/联络资料"""
+        if self._user_info_filled and self._is_user_info_url(page.url):
+            logger.info("s03 已填写过，不再重填；尝试继续进入 s04")
+            await self._advance_from_user_info_to_identity(page)
+            return 0
+
+        if not await self._is_user_info_step(page):
+            await self._recover_step_or_restart(
+                page, self._is_user_info_step, label="s03用户资料"
+            )
+
+        await self._recover_step_or_restart(
+            page, self._user_info_form_is_ready, label="s03用户表单"
+        )
+        try:
+            await page.wait_for_function(
+                """() => /郵遞區號|邮递区号|通訊語言|通讯语言|區.*市.*省/.test(
+                    document.body ? document.body.innerText : ''
+                )""",
+                timeout=20000,
+            )
+        except Exception:
+            pass
+        await page.wait_for_timeout(_FORM_PAUSE_MS)
+        await self._dismiss_cookie_banner(page)
+
+        applicant = data.get("applicant", {})
+        if not isinstance(applicant, dict):
+            applicant = {}
+        name_en = applicant.get("name_en", "")
+        name_cn = "".join(
+            ch for ch in str(applicant.get("name_cn") or "") if "\u4e00" <= ch <= "\u9fff"
+        )
+        director_pre = (data.get("directors") or [{}])[0] or {}
+        if not isinstance(director_pre, dict):
+            director_pre = {}
+        raw_person = str(
+            applicant.get("director_name")
+            or director_pre.get("director_name")
+            or ""
+        )
+        surname_stored = str(applicant.get("surname_en") or "").strip()
+        given_stored = str(applicant.get("given_en") or "").strip()
+        if not surname_stored or not given_stored:
+            surname_stored = surname_stored or str(
+                director_pre.get("surname_en") or ""
+            ).strip()
+            given_stored = given_stored or str(
+                director_pre.get("given_en") or ""
+            ).strip()
+        skip_en = s03_skip_english_name(raw_person, name_cn, str(name_en or ""))
+        if skip_en:
+            surname, given = "", ""
+        elif surname_stored or given_stored:
+            surname, given = surname_stored, given_stored
+        else:
+            given, surname = latin_english_given_surname(
+                str(name_en or ""), str(name_cn or "")
+            )
+        title = applicant.get("title", "Mr")
+        proof = data.get("identity_proof") or {}
+        if not isinstance(proof, dict):
+            proof = {}
+        raw_id_type = str(
+            applicant.get("id_type") or proof.get("id_type") or ""
+        )
+        id_type = self._normalize_icris_id_type(
+            raw_id_type, str(applicant.get("id_number") or proof.get("id_number") or "")
+        )
+        id_type_select = s03_id_type_select_pattern(id_type)
+        # S03 电邮用任务里的联络邮箱（快速注册可改），空才回退申请人邮箱 / 默认联络邮箱
+        contact = data.get("contact") or {}
+        if not isinstance(contact, dict):
+            contact = {}
+        email = (
+            str(contact.get("email") or "").strip()
+            or str(applicant.get("email") or "").strip()
+            or str(getattr(settings, "materials_default_contact_email", "") or "").strip()
+        )
+        phone = applicant.get("phone", "")
+        # 真实董事住址（非 mock）：优先 directors，回退 founder_members
+        director = (data.get("directors") or [{}])[0] or (
+            data.get("founder_members") or [{}]
+        )[0]
+        if not isinstance(director, dict):
+            director = {}
+        addr_en = (director.get("address_en", "") or "").strip()
+        addr_cn = (director.get("address_cn", "") or "").strip()
+        raw_stored = stored_s03_address_fields(director, applicant)
+        stored = s03_address_fields_for_fill(director, applicant)
+        street = stored["street"]
+        region = stored["region"]
+        flat = stored["flat"]
+        building = stored["building"]
+        address_country = stored["country"]
+        is_hk = stored["address_is_hk"] == "1"
+        if not is_hk:
+            flat = clip_icris_addr(flat)
+            building = clip_icris_addr(building)
+            street = clip_icris_addr(street)
+            region = clip_icris_addr(region)
+        if not street and not region and not flat and not building:
+            logger.warning(
+                "用户资料: 住址无法拆分 addr_en=%s",
+                (addr_en or addr_cn)[:80],
+            )
+        elif not raw_stored["street"] and street:
+            logger.info(
+                "用户资料: 由英文住址补全 street=%s country=%s",
+                street[:50],
+                address_country,
+            )
+
+        logger.info(
+            "开始填写用户资料 (url=%s) 电邮=%s 地址HK=%s flat=%s building=%s street=%s region=%s",
+            page.url[:120],
+            email,
+            is_hk,
+            flat[:40],
+            building[:40],
+            street[:40],
+            region[:40],
+        )
+
+        filled = 0
+
+        async def _inc(ok: bool, label: str = "") -> None:
+            nonlocal filled
+            if ok:
+                filled += 1
+                if label:
+                    logger.info("用户资料: %s", label)
+                await page.wait_for_timeout(250)
+
+        # 姓名：英文姓氏/名字 + 中文姓名（按材料有无分别填，空值跳过）
+        for pat, val, name in [
+            (r"英文姓氏|英文姓", surname, "英文姓氏"),
+            (r"英文名字|英文名", given, "英文名字"),
+            (r"中文姓名|中文", name_cn, "中文姓名"),
+        ]:
+            if not val:
+                continue
+            ok = await self._fill_by_placeholder(page, pat, val)
+            if not ok:
+                ok = await self._fill_enabled_field_by_label(page, pat, val)
+            await _inc(ok, name)
+
+        for label_pat, value, ftype, name in [
+            (r"称谓|稱謂|Title", title, "select", "称谓"),
+            (r"身份识别类别|身份識別類別|证件类型|證件類型", id_type_select, "select", "证件类型"),
+            (
+                r"身份识别号码|身份識別號碼|证件号码|證件號碼",
+                applicant.get("id_number") or proof.get("id_number") or "",
+                "text",
+                "证件号码",
+            ),
+        ]:
+            await _inc(
+                await self._fill_enabled_field_by_label(
+                    page, label_pat, str(value), field_type=ftype
+                ),
+                name,
+            )
+
+        # 地址类型：香港→本地地址；否则→非香港地址（专用逻辑，避免误点第一项）
+        addr_radio_ok = await self._select_address_type_radio(page, is_hk=is_hk)
+        await _inc(
+            addr_radio_ok,
+            "本地地址" if is_hk else "非香港地址",
+        )
+        if not addr_radio_ok:
+            logger.warning(
+                "用户资料: 地址类型未选中 is_hk=%s，后续国家/地区可能不可用",
+                is_hk,
+            )
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const sels = [...document.querySelectorAll('select')];
+                    if (sels.some(s => s.options && s.options.length > 1)) return true;
+                    return document.querySelectorAll('.ant-select, [role=combobox]').length > 0;
+                }""",
+                timeout=15000,
+            )
+        except Exception:
+            pass
+        await page.wait_for_timeout(_FORM_PAUSE_MS)
+
+        # 香港：室／樓／座、大廈；非香港：仅当入库已有室/大厦才填
+        if is_hk:
+            if flat:
+                ok = await self._fill_by_placeholder(page, r"室.*樓|室.*楼|Flat.*Floor", flat)
+                if not ok:
+                    ok = await self._fill_enabled_field_by_label(
+                        page, r"室／樓／座|室/楼/座|Flat / Floor", flat
+                    )
+                await _inc(ok, "室/楼/座")
+            else:
+                logger.warning("用户资料: 缺 director_address_flat，不填室/楼/座")
+            if building:
+                ok = await self._fill_by_placeholder(page, r"大廈|大厦|Building", building)
+                if not ok:
+                    ok = await self._fill_enabled_field_by_label(
+                        page, r"大廈|大厦|Building", building
+                    )
+                await _inc(ok, "大厦")
+            else:
+                logger.info("用户资料: 无大厦字段，跳过")
+        else:
+            if flat:
+                ok = await self._fill_by_placeholder(page, r"室.*樓|室.*楼|Flat.*Floor", flat)
+                if not ok:
+                    ok = await self._fill_enabled_field_by_label(
+                        page, r"室／樓／座|室/楼/座|Flat / Floor", flat
+                    )
+                await _inc(ok, "室/楼/座")
+            if building:
+                ok = await self._fill_by_placeholder(page, r"大廈|大厦|Building", building)
+                if not ok:
+                    ok = await self._fill_enabled_field_by_label(
+                        page, r"大廈|大厦|Building", building
+                    )
+                await _inc(ok, "大厦")
+        if street:
+            ok = await self._fill_by_placeholder(page, r"街道|屋苑|地段|村", street)
+            if not ok:
+                ok = await self._fill_enabled_field_by_label(
+                    page, r"街道|屋苑|地段|村", street
+                )
+            await _inc(ok, "街道")
+        else:
+            logger.warning("用户资料: 缺 address_street，不填街道")
+
+        # 区/市/省/州/邮递区号
+        district_kws = ["郵遞區號", "邮递区号", "區/市", "区/市", "區市省", "州"]
+        if is_hk:
+            ok_dist = False
+            if region:
+                ok_dist = await self._select_ant_select_by_keywords(
+                    page, district_kws, region
+                )
+            else:
+                logger.warning(
+                    "用户资料: 缺已入库香港区/邮递区号 addr=%s",
+                    (addr_en or "")[:80],
+                )
+            await _inc(ok_dist, f"区/市/省={region or '(未选)'}")
+        elif region:
+            # 非香港：文本填入拆分后的区/市/省（如 "Shenzhen City, Guangdong Province"）
+            reg_ok = await self._fill_by_placeholder(
+                page, r"區.*市.*省|區市省|州|郵遞", region
+            )
+            if not reg_ok:
+                reg_ok = await self._fill_enabled_field_by_label(
+                    page, r"區.*市.*省|區市省|州|郵遞", region
+                )
+            await _inc(reg_ok, "区/市/省")
+
+        # 国家/地区：只用已入库 address_country
+        if not is_hk:
+            if address_country:
+                country_ok = await self._select_non_hk_country(page, address_country)
+                await _inc(country_ok, "国家/地区")
+                if not country_ok:
+                    logger.warning(
+                        "用户资料: 国家/地区未选中 country=%s",
+                        address_country[:40],
+                    )
+            else:
+                logger.warning("用户资料: 缺 address_country，不现场猜国家")
+
+        # 电邮 + 确认电邮
+        for pat, name in [
+            (r"^电邮地址$|^電郵地址$", "电邮地址"),
+            (r"确认电邮|確認電郵", "确认电邮"),
+        ]:
+            ok = await self._fill_by_placeholder(page, pat, email)
+            if not ok:
+                ok = await self._fill_enabled_field_by_label(page, pat, email)
+            await _inc(ok, name)
+
+        # 香港联络电话
+        ok = await self._fill_by_placeholder(page, r"联络电话|聯絡電話|香港联络", phone)
+        if not ok:
+            ok = await self._fill_enabled_field_by_label(
+                page, r"香港联络|聯絡電話|流动电话|流動電話", phone
+            )
+        await _inc(ok, "联络电话")
+
+        # 通讯语言 → 繁體中文
+        await _inc(
+            await self._select_ant_select_by_keywords(
+                page, ["通訊語言", "通讯语言"], "繁體中文"
+            ),
+            "通讯语言=繁體中文",
+        )
+
+        # 按常见 id/name 再填一次（Vue 表单兜底）
+        id_map = [
+            ("#engSurName, input[name*='engSur' i], input[id*='engSur' i]", surname, "text"),
+            ("#engOtherName, input[name*='engOther' i], input[id*='engOther' i]", given, "text"),
+            ("#nameCh, input[name*='nameCh' i], input[id*='chineseName' i]", name_cn, "text"),
+            ("#emailAddr, input[name*='email' i]:not([name*='confirm' i])", email, "text"),
+            ("input[name*='confirm' i][name*='email' i], input[id*='confirmEmail' i]", email, "text"),
+            ("#mobileNo, input[name*='mobile' i], input[id*='mobile' i], input[name*='phone' i]", phone, "text"),
+            ("#idNo, input[name*='idNo' i], input[id*='idNum' i], input[name*='hkid' i]", applicant.get("id_number", ""), "text"),
+        ]
+        for selector, value, ftype in id_map:
+            if not value:
+                continue
+            for sel in selector.split(", "):
+                sel = sel.strip()
+                if ftype == "text" and await self._fill_native_input(page, sel, str(value)):
+                    filled += 1
+                    break
+
+        logger.info("用户资料已填写 %d 项", filled)
+
+        if filled > 0:
+            self._user_info_filled = True
+            if await self._advance_from_user_info_to_identity(page):
+                await self._log_page(page, "用户资料继续后")
+            else:
+                logger.warning(
+                    "用户资料填写后未能进入 s04（仍停在 %s）",
+                    page.url[:120],
+                )
+                errs = await self._get_validation_errors(page)
+                if errs:
+                    logger.warning("s03 校验错误: %s", errs)
+
+        return filled
+
+    async def _wait_for_identity_proof_step(
+        self, page: "Page", timeout_ms: int = 45000
+    ) -> bool:
+        """等待进入 s04 身份证明页。"""
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const url = (location.href || '').toLowerCase();
+                    if (/registration\\/s04/.test(url)) return true;
+                    const t = document.body ? document.body.innerText : '';
+                    return /身分證明|身份证明/.test(t)
+                        && /證明文件|证明文件/.test(t)
+                        && /網上提交|网上提交|親身到公司註冊處|亲身到公司注册处/.test(t);
+                }""",
+                timeout=timeout_ms,
+            )
+            await self._wait_spin_clear(page, timeout_ms=15000)
+            return True
+        except Exception:
+            return await self._is_identity_proof_step(page)
+
+    def _s04_url_from_current(self, url: str) -> str:
+        """将 registration/s03.do 替换为 s04.do，保留 query。"""
+        u = url or ""
+        if re.search(r"registration/s04\.do", u, re.I):
+            return u
+        return re.sub(
+            r"(registration/)s03(\.do)",
+            r"\1s04\2",
+            u,
+            count=1,
+            flags=re.I,
+        )
+
+    async def _wait_url_step(
+        self,
+        page: "Page",
+        step: str = "s04",
+        *,
+        timeout_ms: int = 45000,
+    ) -> bool:
+        """等待 URL/正文到达指定注册步骤（默认 s04）。"""
+        raw = (step or "s04").lower()
+        mm = re.search(r"([2-9])", raw)
+        num = mm.group(1) if mm else "4"
+        try:
+            await page.wait_for_function(
+                """(n) => {
+                    const url = (location.href || '').toLowerCase();
+                    if (new RegExp('registration\\\\/s0' + n + '\\\\.do').test(url)) return true;
+                    if (n !== '4') return false;
+                    const root = document.body || document.documentElement;
+                    if (!root) return false;
+                    const t = root.innerText || '';
+                    return /身分證明|身份证明/.test(t)
+                        && /證明文件|证明文件/.test(t)
+                        && /網上提交|网上提交|親身到公司註冊處|亲身到公司注册处/.test(t);
+                }""",
+                num,
+                timeout=timeout_ms,
+            )
+            await self._wait_spin_clear(page, timeout_ms=15000)
+            return True
+        except Exception:
+            if num == "4":
+                return await self._is_identity_proof_step(page)
+            return bool(re.search(rf"registration/s0{num}", (page.url or "").lower()))
+
+    async def _raise_restart_if_did_not_advance(
+        self, page: "Page", *, step: str, next_step: str
+    ) -> None:
+        """点继续后仍停在当前步：截图并整段重跑，禁止 reload 冲进下一步。"""
+        await self._raise_if_rerun_on_page_error(page, step=step)
+        logger.warning(
+            "%s 点继续后未进入 %s，不刷新不跳转 url=%s",
+            step,
+            next_step,
+            page.url[:160],
+        )
+        await self._save_error_screenshot(page)
+        raise IcrisRestartFromS01(
+            f"{step} 点继续后未进入 {next_step} url={page.url[:160]}",
+            screenshot_path=self.error_screenshot_path or "",
+        )
+
+    async def _advance_from_user_info_to_identity(self, page: "Page") -> bool:
+        """s03 点继续并等待进入 s04。有 error 或未跳转时不 reload、不直达 s04。"""
+        if await self._is_identity_proof_step(page):
+            return True
+        on_s03 = self._is_s03_user_info_url(page.url) or (
+            await self._is_user_info_step(page)
+            and not self._is_esubmit_terms_url(page.url)
+        )
+        if not on_s03:
+            return await self._is_identity_proof_step(page)
+
+        try:
+            await page.evaluate(
+                "() => { try { document.activeElement && document.activeElement.blur(); } catch (e) {} }"
+            )
+        except Exception:
+            pass
+        await self._wait_spin_clear(page, timeout_ms=15000)
+
+        ok = await self._click_continue(page, expect_step="s04")
+        errs = await self._get_validation_errors(page)
+        if errs:
+            logger.warning("s03→s04 仍有校验: %s", errs)
+            await self._raise_if_rerun_on_page_error(page, errs, step="s03")
+        if await self._is_identity_proof_step(page) and not errs:
+            logger.info("已从用户资料进入身份证明页")
+            return True
+        if ok and not errs and await self._wait_url_step(page, "s04", timeout_ms=8000):
+            logger.info("已从用户资料进入身份证明页")
+            return True
+        if self._is_home_or_portal(page.url):
+            logger.error("s03 继续后跳转首页")
+            return False
+
+        await self._raise_restart_if_did_not_advance(
+            page, step="s03", next_step="s04"
+        )
+        return False
+
+    async def _advance_from_identity_to_esubmit(self, page: "Page") -> bool:
+        """s04 点继续并等待进入 s03a；不拼 URL 强行跳转。"""
+        if await self._is_esubmit_terms_step(page):
+            return True
+        if not self._is_identity_proof_url(page.url) and not await self._is_identity_proof_step(
+            page
+        ):
+            return await self._is_esubmit_terms_step(page)
+
+        try:
+            await page.evaluate(
+                "() => { try { document.activeElement && document.activeElement.blur(); } catch (e) {} }"
+            )
+        except Exception:
+            pass
+        await self._wait_spin_clear(page, timeout_ms=15000)
+        await self._raise_if_id_already_registered(page)
+
+        for attempt in range(1, 3):
+            ok = await self._click_continue(page)
+            if not ok:
+                logger.warning("s04→s03a 继续点击/等待失败 (尝试 %d/2)", attempt)
+            if await self._wait_step_ready(
+                page,
+                self._is_esubmit_terms_step,
+                timeout_ms=_STEP_READY_MS,
+                label="s03a",
+            ):
+                logger.info("已从身份证明进入 s03a 条款页")
+                return True
+            if self._is_home_or_portal(page.url):
+                logger.error("s04 继续后跳转首页")
+                return False
+            errs = await self._get_validation_errors(page)
+            await self._raise_if_id_already_registered(page, errs)
+            await self._raise_if_format_invalid(page, errs, step="s04")
+            if errs:
+                logger.warning("s04→s03a 仍有校验: %s", errs)
+                await self._raise_if_rerun_on_page_error(page, errs, step="s04")
+                return False
+            if self._is_identity_proof_url(page.url):
+                break
+            await page.wait_for_timeout(600)
+
+        if self._is_identity_proof_url(page.url):
+            await self._raise_if_id_already_registered(page)
+            await self._raise_if_format_invalid(page, step="s04")
+            logger.warning(
+                "s04 点继续后仍停在身份证明页（不强制跳 s03a） url=%s",
+                page.url[:120],
+            )
+        return await self._is_esubmit_terms_step(page)
+
+    def _is_identity_proof_url(self, url: str) -> bool:
+        return bool(re.search(r"registration/s04", url.lower()))
+
+    async def _is_identity_proof_step(self, page: "Page") -> bool:
+        if self._is_identity_proof_url(page.url):
+            return True
+        return bool(
+            await page.evaluate(
+                """() => {
+                    const t = document.body ? document.body.innerText : '';
+                    return /身分證明|身份证明/.test(t)
+                        && /證明文件|证明文件/.test(t)
+                        && /網上提交|网上提交|親身到公司註冊處|亲身到公司注册处/.test(t);
+                }"""
+            )
+        )
+
+    def _is_esubmit_terms_url(self, url: str) -> bool:
+        return bool(re.search(r"registration/s03a", (url or "").lower()))
+
+    def _is_s01_url(self, url: str) -> bool:
+        return bool(re.search(r"registration/s01", (url or "").lower()))
+
+    async def _esubmit_terms_copy_present(self, page: "Page") -> bool:
+        """条款+确认文案是否在页上（简繁均可）。不能只凭 URL。"""
+        try:
+            return bool(
+                await page.evaluate(
+                    """() => {
+                        const root = document.body || document.documentElement;
+                        if (!root) return false;
+                        const t = root.innerText || '';
+                        return /电子提交服务的条款|電子提交服務的條款/.test(t)
+                            && /资料正确完整|資料正確完整/.test(t);
+                    }"""
+                )
+            )
+        except Exception:
+            return False
+
+    async def _is_esubmit_terms_step(self, page: "Page") -> bool:
+        """s03a：电子提交服务的条款和条件（双确认勾选页）。
+
+        必须见到条款文案。点完繼續后 URL 仍可能是 s03a.do，不能据此当成还在条款页。
+        """
+        return await self._esubmit_terms_copy_present(page)
+
+    def _is_success_page_url(self, url: str) -> bool:
+        return bool(re.search(r"registration/s05", (url or "").lower()))
+
+    async def _is_success_step(self, page: "Page") -> bool:
+        """s05：只认 URL（registration/s05）。成功文案不参与判定。"""
+        return self._is_success_page_url(page.url)
+
+    async def _s03a_post_continue_where(self, page: "Page") -> str:
+        """点繼續/刷新后所在页：s05 | s03a | s01 | left。"""
+        if self._is_success_page_url(page.url):
+            return "s05"
+        if await self._is_esubmit_terms_step(page):
+            return "s03a"
+        if self._is_s01_url(page.url):
+            return "s01"
+        return "left"
+
+    async def _esubmit_page_is_traditional(self, page: "Page") -> bool:
+        """s03a 是否为繁体界面（用于优先匹配文案）。"""
+        try:
+            return bool(
+                await page.evaluate(
+                    """() => {
+                        const t = (document.body && document.body.innerText) || '';
+                        const href = location.href || '';
+                        if (/locale=zh_TW|zh_HK|zh-TW/i.test(href)) return true;
+                        // 繁体特有字：讀/認/資/據/約/條
+                        return /本人已閱讀|本人確認以上|資料正確完整|個人資料收集聲明/.test(t);
+                    }"""
+                )
+            )
+        except Exception:
+            return False
+
+    async def _esubmit_terms_is_ready(self, page: "Page") -> bool:
+        """s03a：两句确认文案出现且至少有一个 checkbox。"""
+        if not await self._is_esubmit_terms_step(page):
+            return False
+        try:
+            has_text = await page.evaluate(
+                """() => {
+                    const t = (document.body && document.body.innerText) || '';
+                    const terms = /本人已阅读[、,，]?理解并同意|本人已閱讀[、,，]?理解並同意/.test(t);
+                    const confirm = /本人确认以上提供的资料正确完整|本人確認以上提供的資料正確完整/.test(t);
+                    return terms && confirm;
+                }"""
+            )
+            if not has_text:
+                return False
+            n = await page.locator(
+                "input[type='checkbox'], .ant-checkbox, .ant-checkbox-inner"
+            ).count()
+            return n >= 1
+        except Exception:
+            return False
+
+    async def _verify_esubmit_terms_checked(self, page: "Page") -> dict[str, bool]:
+        """校验两句确认文案对应的 checkbox 是否已勾选（简繁均可）。"""
+        return await page.evaluate(
+            """() => {
+                // 简繁并列；阅读/閱讀、确认/確認、资料/資料、约束/約束
+                const TERMS_RE = /本人已(阅读|閱讀)[、,，]?理解(并|並)同意|本人已(阅读|閱讀).*(约束|約束)/;
+                const CONFIRM_RE = /本人(确认|確認)以上提供的(资料|資料)(正确|正確)完整/;
+
+                function rowText(el) {
+                    return ((el && (el.innerText || el.textContent)) || '').replace(/\\s+/g, '');
+                }
+                function isChecked(row) {
+                    if (!row) return false;
+                    const inp = row.querySelector("input[type='checkbox']");
+                    if (inp && inp.checked) return true;
+                    if (row.classList && (
+                        row.classList.contains('ant-checkbox-wrapper-checked')
+                        || row.querySelector('.ant-checkbox-checked')
+                    )) return true;
+                    return false;
+                }
+                function findRow(re) {
+                    const cands = Array.from(document.querySelectorAll(
+                        '.ant-checkbox-wrapper, label.ant-checkbox-wrapper, label'
+                    ));
+                    let best = null;
+                    let bestLen = Infinity;
+                    for (const el of cands) {
+                        const t = rowText(el);
+                        if (!t || t.length > 500 || !re.test(t)) continue;
+                        if (t.length < bestLen) {
+                            best = el;
+                            bestLen = t.length;
+                        }
+                    }
+                    if (best) return best;
+                    // 回退：任意含文案的节点再向上找 wrapper
+                    for (const el of document.querySelectorAll('div, span, p, li, td')) {
+                        const t = rowText(el);
+                        if (!t || t.length > 500 || !re.test(t)) continue;
+                        const wrap = el.closest(
+                            '.ant-checkbox-wrapper, label, .ant-form-item, tr, .ant-row'
+                        );
+                        if (wrap) return wrap;
+                    }
+                    return null;
+                }
+                const termsRow = findRow(TERMS_RE);
+                const confirmRow = findRow(CONFIRM_RE);
+                const terms = isChecked(termsRow);
+                const confirm = isChecked(confirmRow);
+                return {
+                    terms,
+                    confirm,
+                    ok: !!(terms && confirm),
+                    found_terms: !!termsRow,
+                    found_confirm: !!confirmRow,
+                };
+            }"""
+        )
+
+    async def _force_check_esubmit_row(
+        self, page: "Page", *, needle: str, label: str
+    ) -> bool:
+        """按文案找到行：若未勾则 check/点方块一次；已勾则跳过（防二次点击取消）。"""
+        try:
+            # 优先 ant-checkbox-wrapper（含隐藏 input）
+            wrap = page.locator(".ant-checkbox-wrapper, label").filter(
+                has_text=needle
+            ).first
+            if await wrap.count() == 0:
+                text_loc = page.get_by_text(needle, exact=False).first
+                if await text_loc.count() == 0:
+                    return False
+                wrap = text_loc.locator(
+                    "xpath=ancestor::*[contains(@class,'ant-checkbox-wrapper') "
+                    "or .//input[@type='checkbox'] "
+                    "or .//span[contains(@class,'ant-checkbox')]][1]"
+                ).first
+            if await wrap.count() == 0:
+                return False
+
+            await wrap.scroll_into_view_if_needed()
+            cls = (await wrap.get_attribute("class") or "")
+            inp = wrap.locator("input[type='checkbox']").first
+            already = "ant-checkbox-wrapper-checked" in cls or "ant-checkbox-checked" in cls
+            if not already and await inp.count() > 0:
+                try:
+                    already = await inp.is_checked()
+                except Exception:
+                    already = False
+            if already:
+                logger.info("s03a 已勾选，跳过点击: %s", label)
+                return True
+
+            # Playwright check 幂等，不会把已勾的取消
+            if await inp.count() > 0:
+                try:
+                    await inp.check(force=True, timeout=5000)
+                    await inp.dispatch_event("input")
+                    await inp.dispatch_event("change")
+                    await page.wait_for_timeout(250)
+                    if await inp.is_checked():
+                        logger.info("s03a check() 成功: %s", label)
+                        return True
+                except Exception:
+                    logger.debug("s03a check() 失败，改点方块: %s", label, exc_info=True)
+
+            box = wrap.locator(".ant-checkbox-inner, .ant-checkbox").first
+            if await box.count() > 0:
+                await box.click(force=True, timeout=5000)
+            else:
+                await wrap.click(force=True, timeout=5000)
+            await page.wait_for_timeout(300)
+
+            if await inp.count() > 0:
+                try:
+                    if not await inp.is_checked():
+                        await inp.check(force=True)
+                        await inp.dispatch_event("change")
+                    ok = await inp.is_checked()
+                except Exception:
+                    ok = "ant-checkbox-wrapper-checked" in (
+                        await wrap.get_attribute("class") or ""
+                    )
+            else:
+                ok = "ant-checkbox-wrapper-checked" in (
+                    await wrap.get_attribute("class") or ""
+                ) or "ant-checkbox-checked" in (
+                    await wrap.get_attribute("class") or ""
+                )
+            logger.info("s03a 点方块后 checked=%s: %s", ok, label)
+            return bool(ok)
+        except Exception:
+            logger.debug("s03a 勾选失败: %s", label, exc_info=True)
+            return False
+
+    async def _tick_esubmit_terms(self, page: "Page") -> bool:
+        """勾选 s03a 两个确认框并保持勾选态。"""
+        trad = await self._esubmit_page_is_traditional(page)
+        logger.info("s03a 界面语言判定 traditional=%s", trad)
+
+        # 按界面语言优先：繁体页先试繁体针，再试简体；反之亦然
+        terms_needles_zh: list[tuple[str, str]] = [
+            ("本人已阅读、理解并同意", "条款-简"),
+            ("本人已阅读", "条款-简短"),
+        ]
+        terms_needles_tw: list[tuple[str, str]] = [
+            ("本人已閱讀、理解並同意", "条款-繁"),
+            ("本人已閱讀", "条款-繁短"),
+        ]
+        confirm_needles_zh: list[tuple[str, str]] = [
+            ("本人确认以上提供的资料正确完整", "确认-简"),
+            ("本人确认以上", "确认-简短"),
+        ]
+        confirm_needles_tw: list[tuple[str, str]] = [
+            ("本人確認以上提供的資料正確完整", "确认-繁"),
+            ("本人確認以上", "确认-繁短"),
+        ]
+        if trad:
+            terms_needles = terms_needles_tw + terms_needles_zh
+            confirm_needles = confirm_needles_tw + confirm_needles_zh
+        else:
+            terms_needles = terms_needles_zh + terms_needles_tw
+            confirm_needles = confirm_needles_zh + confirm_needles_tw
+
+        async def _ensure_key(key: str, needles: list[tuple[str, str]]) -> bool:
+            mid = await self._verify_esubmit_terms_checked(page)
+            if (mid or {}).get(key):
+                return True
+            for needle, lab in needles:
+                await self._force_check_esubmit_row(page, needle=needle, label=lab)
+                mid = await self._verify_esubmit_terms_checked(page)
+                if (mid or {}).get(key):
+                    return True
+            return bool((await self._verify_esubmit_terms_checked(page) or {}).get(key))
+
+        await _ensure_key("terms", terms_needles)
+        await _ensure_key("confirm", confirm_needles)
+
+        # 仍缺：JS 按简繁正则强制设 checked（只设不 toggle）
+        verify = await self._verify_esubmit_terms_checked(page)
+        if not (verify or {}).get("ok"):
+            await page.evaluate(
+                """() => {
+                    const TERMS_RE = /本人已(阅读|閱讀)[、,，]?理解(并|並)同意|本人已(阅读|閱讀).*(约束|約束)/;
+                    const CONFIRM_RE = /本人(确认|確認)以上提供的(资料|資料)(正确|正確)完整/;
+                    function rowText(el) {
+                        return ((el && (el.innerText || el.textContent)) || '').replace(/\\s+/g, '');
+                    }
+                    function forceOn(re) {
+                        const wraps = Array.from(document.querySelectorAll(
+                            '.ant-checkbox-wrapper, label'
+                        ));
+                        let best = null, bestLen = Infinity;
+                        for (const w of wraps) {
+                            const t = rowText(w);
+                            if (!t || t.length > 500 || !re.test(t)) continue;
+                            if (t.length < bestLen) { best = w; bestLen = t.length; }
+                        }
+                        if (!best) return false;
+                        const inp = best.querySelector("input[type='checkbox']");
+                        const ant = best.querySelector('.ant-checkbox');
+                        const inner = best.querySelector('.ant-checkbox-inner');
+                        if (inp && inp.checked) return true;
+                        if (inner) { try { inner.click(); } catch (e) {} }
+                        else if (ant) { try { ant.click(); } catch (e) {} }
+                        else { try { best.click(); } catch (e) {} }
+                        if (inp && !inp.checked) {
+                            inp.checked = true;
+                            inp.dispatchEvent(new Event('input', { bubbles: true }));
+                            inp.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        if (ant) ant.classList.add('ant-checkbox-checked');
+                        best.classList.add('ant-checkbox-wrapper-checked');
+                        return !!(inp && inp.checked) || best.classList.contains('ant-checkbox-wrapper-checked');
+                    }
+                    return { terms: forceOn(TERMS_RE), confirm: forceOn(CONFIRM_RE) };
+                }"""
+            )
+            await page.wait_for_timeout(400)
+            # 再幂等 check 一遍（只补未勾）
+            for needle, lab in terms_needles[:2] + confirm_needles[:2]:
+                await self._force_check_esubmit_row(page, needle=needle, label=f"{lab}-补")
+            verify = await self._verify_esubmit_terms_checked(page)
+
+        terms_ok = bool((verify or {}).get("terms"))
+        confirm_ok = bool((verify or {}).get("confirm"))
+        both_ok = bool((verify or {}).get("ok"))
+        logger.info(
+            "s03a 校验 terms=%s confirm=%s ok=%s found=%s/%s",
+            terms_ok,
+            confirm_ok,
+            both_ok,
+            (verify or {}).get("found_terms"),
+            (verify or {}).get("found_confirm"),
+        )
+
+        if not both_ok:
+            logger.error(
+                "s03a 两个确认框仍未全部勾选（条款=%s 确认=%s），放弃提交",
+                terms_ok,
+                confirm_ok,
+            )
+            return False
+
+        # 短暂等待后复验，防止 Vue 打回
+        await page.wait_for_timeout(500)
+        still = await self._verify_esubmit_terms_checked(page)
+        if not (still or {}).get("ok"):
+            logger.warning("s03a 勾选态被打回，再补勾一次")
+            for needle, lab in (
+                (terms_needles[0] if terms_needles else ("本人已阅读", "条款")),
+                (confirm_needles[0] if confirm_needles else ("本人确认以上", "确认")),
+            ):
+                await self._force_check_esubmit_row(
+                    page, needle=needle[0], label=f"{needle[1]}-保活"
+                )
+            still = await self._verify_esubmit_terms_checked(page)
+            if not (still or {}).get("ok"):
+                logger.error("s03a 勾选无法保持，放弃提交")
+                return False
+        return True
+
+    def _s03a_continue_error_text(self, errs: list[str], page: "Page") -> str:
+        msg = next((t for t in errs if t), "")
+        return msg or f"未进入提交成功页 url={page.url[:160]}"
+
+    async def _submit_esubmit_to_s05(self, page: "Page") -> bool:
+        """点红色繼續：出错则记原因截图、刷新后勾选再点一次；打回 s01/离开条款则整段重跑。"""
+        still = await self._verify_esubmit_terms_checked(page)
+        if not (still or {}).get("ok"):
+            logger.error("s03a 提交前校验失败：勾选状态丢失")
+            return False
+
+        for attempt in (1, 2):
+            where = await self._s03a_post_continue_where(page)
+            if where == "s05":
+                await self._log_page(page, "s03a 继续后")
+                return True
+
+            logger.info("s03a 点击红色繼續进入 s05 (尝试 %d/2)", attempt)
+            ok = await self._click_continue(page, expect_step="s05")
+            where = await self._s03a_post_continue_where(page)
+            if ok or where == "s05":
+                await self._log_page(page, "s03a 继续后")
+                return True
+
+            errs = await self._get_validation_errors(page)
+            err_text = self._s03a_continue_error_text(errs, page)
+            logger.error("s03a 点继续后失败 (尝试 %d/2): %s", attempt, err_text)
+            await self._save_error_screenshot(page)
+
+            if attempt == 2:
+                raise IcrisRestartFromS01(f"{where} {err_text}")
+
+            logger.warning("s03a 点继续失败，刷新后重试一次")
+            try:
+                await page.reload(wait_until="commit", timeout=45000)
+                await self._wait_spin_clear(page, timeout_ms=_STEP_READY_MS)
+            except Exception as exc:
+                logger.warning("s03a 刷新失败: %s", exc)
+
+            where = await self._s03a_post_continue_where(page)
+            if where == "s05":
+                await self._log_page(page, "s03a 刷新后")
+                return True
+            if where != "s03a":
+                raise IcrisRestartFromS01(
+                    f"{where} url={page.url[:160]} 报错={err_text}"
+                )
+            if not await self._tick_esubmit_terms(page):
+                raise IcrisRestartFromS01("s03a 刷新后无法重新勾选确认框")
+
+        raise IcrisRestartFromS01(
+            f"s03a 点继续后未进入提交成功页: {page.url[:160]}"
+        )
+
+    async def _accept_esubmit_terms(
+        self, page: "Page", *, submit: bool
+    ) -> bool:
+        """勾选 s03a 两个确认框（简繁文案都覆盖）；submit=True 时再点提交。"""
+        if not await self._is_esubmit_terms_step(page):
+            return False
+
+        if not await self._wait_step_ready(
+            page,
+            self._esubmit_terms_is_ready,
+            timeout_ms=_STEP_READY_MS,
+            label="s03a条款确认",
+        ):
+            await self._recover_step_or_restart(
+                page, self._esubmit_terms_is_ready, label="s03a条款确认"
+            )
+
+        await self._dismiss_cookie_banner(page)
+        if not await self._tick_esubmit_terms(page):
+            return False
+
+        logger.info(
+            "s03a 两框已勾选并保持 submit=%s allow_submit=%s",
+            submit,
+            self.allow_submit,
+        )
+        if not submit:
+            logger.info("s03a dry_run/未允许提交：已勾选但不点提交")
+            return True
+        return await self._submit_esubmit_to_s05(page)
+
+    def _normalize_icris_id_type(self, raw: str, id_number: str = "") -> str:
+        """归一证件类型：库里已有则尊重；空类型才弱兜底。"""
+        return normalize_stored_id_type(raw, id_number)
+
+    def _derive_identity_proof(self, data: dict[str, Any]) -> dict[str, Any]:
+        """解析身份证明选项：按 HKID / 中国身份证 / 护照勾选对应项。"""
+        proof = data.get("identity_proof") or {}
+        applicant = data.get("applicant") or {}
+        founders = data.get("founder_members") or []
+        founder = founders[0] if founders and isinstance(founders[0], dict) else {}
+        id_number = str(
+            proof.get("id_number")
+            or applicant.get("id_number")
+            or founder.get("id_number")
+            or ""
+        ).strip()
+        id_type = self._normalize_icris_id_type(
+            str(
+                proof.get("id_type")
+                or applicant.get("id_type")
+                or founder.get("id_type")
+                or ""
+            ),
+            id_number,
+        )
+
+        # ICRIS s04 常见文案：优先「身分证／身分證」（分），「身份」仅次要兼容
+        type_labels = {
+            "HKID": (
+                r"香港身分證號碼|香港身分证号码|香港身份证号码|"
+                r"香港身分證|香港身分证|香港身份証|香港身份证"
+            ),
+            "PRC_ID": (
+                r"中华人民共和国身分证号码|中華人民共和國身分证號碼|"
+                r"中華人民共和國身分證號碼|中华人民共和国身分證号码|"
+                r"中华人民共和国身份证号码|"
+                r"中華人民共和國身分證|中华人民共和国身分证|"
+                r"中华人民共和国身份证|中國身分證|中国身分证|中国身份证"
+            ),
+            "PASSPORT": r"護照號碼|护照号码|^護照$|^护照$|護照|护照",
+        }
+        issuing_country = str(
+            proof.get("issuing_country")
+            or applicant.get("issuing_country")
+            or founder.get("issuing_country")
+            or ""
+        ).strip()
+
+        id_type_pat = type_labels.get(id_type, type_labels["PRC_ID"])
+        if proof.get("id_type_label"):
+            id_type_pat = re.escape(str(proof["id_type_label"]))
+
+        submission = str(proof.get("submission_method") or "online").lower()
+        if submission in ("in_person", "onsite", "person"):
+            submission_pat = r"親身到公司註冊處|亲身到公司注册处|出示證明文件正本|出示证明文件正本"
+        else:
+            submission_pat = r"^網上提交$|^网上提交$|網上提交|网上提交"
+
+        online_method = str(proof.get("online_document_method") or "certified_copy").lower()
+        if online_method in ("digital", "digital_cert", "cert"):
+            online_pat = r"使用數碼證書|使用数码证书|數碼證書|数码证书"
+        else:
+            online_pat = (
+                r"經核證真實副本|经核证真实副本|身分證明文件的經核證|身份证明文件的经核证"
+            )
+        if proof.get("online_document_label"):
+            online_pat = re.escape(str(proof["online_document_label"]))
+
+        return {
+            "id_type": id_type,
+            "id_number": id_number,
+            "issuing_country": issuing_country,
+            "id_type_pat": id_type_pat,
+            "submission_pat": submission_pat,
+            "online_pat": online_pat,
+            "submission_method": submission,
+            "online_method": online_method,
+            "document_files": self._resolve_identity_document_files(proof),
+        }
+
+    def _resolve_identity_document_files(self, proof: dict[str, Any]) -> list[str]:
+        """解析身份证照片路径：优先 mock 配置，否则在桌面「戴启乐资料*」中查找"""
+        files: list[str] = []
+        for item in proof.get("document_files") or []:
+            p = Path(str(item)).expanduser()
+            if p.is_file():
+                files.append(str(p.resolve()))
+        if files:
+            return files
+
+        dirs: list[Path] = []
+        if proof.get("document_dir"):
+            dirs.append(Path(str(proof["document_dir"])).expanduser())
+        desktop = Path.home() / "Desktop"
+        if desktop.is_dir():
+            for d in sorted(desktop.glob("戴启乐资料*")):
+                if d.is_dir():
+                    dirs.append(d)
+
+        preferred_names = (
+            "身份证",
+            "身份证正面",
+            "身份证方面",
+            "身份证反面",
+            "身分證正面",
+            "身分證反面",
+        )
+        for d in dirs:
+            if not d.is_dir():
+                continue
+            for name in preferred_names:
+                for ext in (".jpg", ".jpeg", ".png", ".pdf", ".JPG", ".PNG"):
+                    cand = d / f"{name}{ext}"
+                    if cand.is_file() and str(cand.resolve()) not in files:
+                        files.append(str(cand.resolve()))
+            # 已找到「身份证.jpg」这类主图则不再堆叠其它
+            if any(Path(f).stem == "身份证" for f in files):
+                files = [f for f in files if Path(f).stem == "身份证"]
+                break
+            if files:
+                break
+
+        if not files:
+            logger.warning(
+                "未找到身份证照片（请检查 identity_proof.document_files / document_dir）"
+            )
+        else:
+            logger.info("身份证明上传文件: %s", [Path(f).name for f in files])
+        return files
+
+    async def _upload_identity_documents(self, page: "Page", file_paths: list[str]) -> int:
+        """选择经核证真实副本后上传身份证照片"""
+        if not file_paths:
+            return 0
+        existing = [p for p in file_paths if Path(p).is_file()]
+        if not existing:
+            logger.warning("身份证照片文件不存在: %s", file_paths)
+            return 0
+
+        await page.wait_for_timeout(500)
+        # 等待上传控件出现
+        try:
+            await page.wait_for_selector(
+                "input[type='file'], .ant-upload, button:has-text('上載'), button:has-text('上传'), "
+                "button:has-text('選擇'), button:has-text('选择'), a:has-text('上載')",
+                timeout=8000,
+            )
+        except Exception:
+            logger.debug("上传控件等待超时，继续尝试定位 input[type=file]")
+
+        uploaded = 0
+        file_inputs = page.locator("input[type='file']")
+        count = await file_inputs.count()
+        if count > 0:
+            # 多个 input：正面/反面分别上传；单个 input：一次传全部（若支持 multiple）
+            if count >= len(existing):
+                for i, path in enumerate(existing):
+                    try:
+                        await file_inputs.nth(i).set_input_files(path)
+                        uploaded += 1
+                        logger.info("已上传身份证明文件[%d]: %s", i + 1, Path(path).name)
+                        await page.wait_for_timeout(800)
+                        await self._wait_spin_clear(page, timeout_ms=20000)
+                    except Exception as e:
+                        logger.warning("上传失败 [%s]: %s", Path(path).name, e)
+            else:
+                try:
+                    await file_inputs.first.set_input_files(existing)
+                    uploaded = len(existing)
+                    logger.info(
+                        "已批量上传身份证明文件: %s",
+                        [Path(p).name for p in existing],
+                    )
+                    await page.wait_for_timeout(1000)
+                    await self._wait_spin_clear(page, timeout_ms=30000)
+                except Exception as e:
+                    # 不支持 multiple 时逐个试
+                    logger.debug("批量上传失败，改为逐个: %s", e)
+                    for path in existing:
+                        try:
+                            await file_inputs.first.set_input_files(path)
+                            uploaded += 1
+                            logger.info("已上传: %s", Path(path).name)
+                            await page.wait_for_timeout(800)
+                            await self._wait_spin_clear(page, timeout_ms=20000)
+                        except Exception as exc:
+                            logger.warning("上传失败 [%s]: %s", Path(path).name, exc)
+            return uploaded
+
+        # 无隐藏 file input：点击上传按钮触发文件选择器
+        upload_btns = [
+            page.locator("button, a, span").filter(
+                has_text=re.compile(r"上載|上传|選擇檔案|选择文件|Browse|Upload|附加", re.I)
+            ).first,
+            page.locator(".ant-upload button, .ant-btn").filter(
+                has_text=re.compile(r"上載|上传|選擇|选择", re.I)
+            ).first,
+        ]
+        for btn in upload_btns:
+            if await btn.count() == 0 or not await btn.is_visible():
+                continue
+            try:
+                async with page.expect_file_chooser(timeout=5000) as fc_info:
+                    await btn.click()
+                chooser = await fc_info.value
+                await chooser.set_files(existing if len(existing) == 1 else existing[:1])
+                uploaded = 1
+                logger.info("通过文件选择器上传: %s", Path(existing[0]).name)
+                await page.wait_for_timeout(1000)
+                await self._wait_spin_clear(page, timeout_ms=30000)
+                # 若还有第二张，再点一次
+                if len(existing) > 1:
+                    try:
+                        async with page.expect_file_chooser(timeout=5000) as fc2:
+                            await btn.click()
+                        chooser2 = await fc2.value
+                        await chooser2.set_files(existing[1])
+                        uploaded += 1
+                        logger.info("通过文件选择器上传: %s", Path(existing[1]).name)
+                        await page.wait_for_timeout(1000)
+                        await self._wait_spin_clear(page, timeout_ms=30000)
+                    except Exception as e:
+                        logger.debug("第二张上传跳过: %s", e)
+                return uploaded
+            except Exception as e:
+                logger.debug("文件选择器上传失败: %s", e)
+
+        logger.warning("未找到可上传的文件控件")
+        return 0
+
+    async def _wait_identity_upload_complete(
+        self, page: "Page", timeout_ms: int = 30000
+    ) -> bool:
+        """等待 s04 身份证明文件上传真正完成。
+
+        antd Upload 组件上传中会出现 `.ant-upload-list-item-uploading`，
+        完成后变为 `.ant-upload-list-item-done`。此处轮询直到无 uploading 项
+        且至少有一个 done 项（或超时回退到 spin 清除）。
+        """
+        if page.is_closed():
+            return False
+        deadline = time.time() + max(1.0, timeout_ms / 1000)
+        saw_list = False
+        while time.time() < deadline:
+            if page.is_closed():
+                return False
+            try:
+                uploading = await page.locator(
+                    ".ant-upload-list-item-uploading"
+                ).count()
+                done = await page.locator(
+                    ".ant-upload-list-item-done, .ant-upload-list-item"
+                ).count()
+                if done > 0:
+                    saw_list = True
+                if uploading == 0 and saw_list:
+                    # 上传列表存在且无上传中项 → 完成
+                    return True
+                if uploading == 0 and not await self._is_spinning(page) and saw_list:
+                    return True
+            except Exception:
+                if not await self._is_spinning(page):
+                    return True
+            await page.wait_for_timeout(800)
+        # 超时回退：只要 spin 清了就算完成
+        try:
+            await self._wait_spin_clear(page, timeout_ms=5000)
+        except Exception:
+            pass
+        logger.warning(
+            "身份证明上传等待超时 %dms（saw_list=%s）", timeout_ms, saw_list
+        )
+        return not await self._is_spinning(page)
+
+    async def _click_radio_by_text(self, page: "Page", text_pattern: str) -> bool:
+        """按可见文案点击 radio / ant-radio-wrapper"""
+        if await self._verify_option_selected(page, text_pattern, option_type="radio"):
+            logger.info("已选中 radio: %s", text_pattern)
+            return True
+        section_pat = (
+            r"身分證明|身份证明|證明文件提交方式|证明文件提交方式|"
+            r"證明文件|证明文件"
+        )
+        if await self._select_radio_in_section(page, section_pat, text_pattern):
+            return True
+        opt_re = re.compile(text_pattern, re.I)
+        wrappers = page.locator(".ant-radio-wrapper, label").filter(has_text=opt_re)
+        try:
+            n = await wrappers.count()
+        except Exception:
+            return False
+        for i in range(n):
+            item = wrappers.nth(i)
+            try:
+                if not await item.is_visible():
+                    continue
+                txt = (await item.inner_text(timeout=_S04_LOCATOR_MS)).strip()
+            except Exception:
+                continue
+            if not opt_re.search(txt):
+                continue
+            # 避免「網上提交」误点到整段说明
+            if len(txt) > _S04_RADIO_LABEL_MAX and not re.search(
+                r"^網上提交|^网上提交", txt
+            ):
+                continue
+            if re.search(r"請選擇|请选择", txt) and len(txt) > 40:
+                continue
+            try:
+                await item.scroll_into_view_if_needed(timeout=_S04_LOCATOR_MS)
+                await item.click(timeout=_S04_LOCATOR_MS)
+                await page.wait_for_timeout(300)
+                logger.info("已点击 radio: %s", txt[:40])
+                return True
+            except Exception:
+                inp = item.locator("input[type='radio']").first
+                try:
+                    if await inp.count() > 0:
+                        await inp.check(force=True, timeout=_S04_LOCATOR_MS)
+                        await page.wait_for_timeout(300)
+                        logger.info("已 force 选中 radio: %s", txt[:40])
+                        return True
+                except Exception:
+                    pass
+        return False
+
+    async def _evaluate_capped(
+        self,
+        page: "Page",
+        expression: str,
+        arg: Any = None,
+        *,
+        timeout_ms: int = _S04_LOCATOR_MS,
+    ) -> Any:
+        """page.evaluate 无 timeout 参数，用 wait_for 封顶避免静默挂死。"""
+        return await asyncio.wait_for(
+            page.evaluate(expression, arg),
+            timeout=max(0.5, timeout_ms / 1000),
+        )
+
+    async def _wait_s04_id_type_radios(
+        self, page: "Page", timeout_ms: int = _S04_RADIO_WAIT_MS
+    ) -> bool:
+        """等 s04 证件类型 radio 出现。遮罩一直不消则抛载入超时。"""
+        deadline = time.monotonic() + max(0.5, timeout_ms / 1000)
+        logger.info("s04 勾选证件类型 等待radio")
+        while time.monotonic() < deadline:
+            self._raise_if_cancelled()
+            if page.is_closed():
+                return False
+            if await self._is_spinning(page):
+                remain_ms = max(200, int((deadline - time.monotonic()) * 1000))
+                await self._wait_spin_clear(page, timeout_ms=min(3000, remain_ms))
+                if await self._is_spinning(page):
+                    if time.monotonic() >= deadline:
+                        raise IcrisLoadingTimeoutError(
+                            register_loading_timeout_message("s04")
+                        )
+                    await page.wait_for_timeout(min(400, remain_ms))
+                    continue
+            try:
+                n = await self._evaluate_capped(
+                    page,
+                    """() => {
+                        const root = document.body || document.documentElement;
+                        if (!root) return 0;
+                        return root.querySelectorAll(
+                            "input[type='radio'], .ant-radio-wrapper"
+                        ).length;
+                    }""",
+                    timeout_ms=_S04_LOCATOR_MS,
+                )
+                if int(n or 0) > 0:
+                    return True
+            except Exception:
+                if page.is_closed():
+                    return False
+            remain_ms = max(100, int((deadline - time.monotonic()) * 1000))
+            await page.wait_for_timeout(min(400, remain_ms))
+        if await self._is_spinning(page):
+            raise IcrisLoadingTimeoutError(register_loading_timeout_message("s04"))
+        logger.warning("s04 证件类型 radio 未出现")
+        return False
+
+    async def _select_identity_id_type_radio(
+        self,
+        page: "Page",
+        id_type: str,
+        id_type_pat: str,
+        *,
+        timeout_ms: int = _S04_RADIO_WAIT_MS,
+    ) -> bool:
+        """s04 勾选身份证明类型：香港身分證 / 中華人民共和國身分證 / 護照。"""
+        preferred: dict[str, tuple[str, ...]] = {
+            "HKID": (
+                "香港身分證號碼",
+                "香港身分证号码",
+                "香港身份证号码",
+                "香港身分證",
+                "香港身分证",
+                "香港身份证",
+            ),
+            "PRC_ID": (
+                "中华人民共和国身分证号码",
+                "中華人民共和國身分证號碼",
+                "中華人民共和國身分證號碼",
+                "中华人民共和国身分證号码",
+                "中华人民共和国身份证号码",
+                "中華人民共和國身分證",
+                "中华人民共和国身分证",
+                "中华人民共和国身份证",
+            ),
+            "PASSPORT": (
+                "護照號碼",
+                "护照号码",
+                "護照",
+                "护照",
+            ),
+        }
+        labels = preferred.get(id_type, preferred["PRC_ID"])
+
+        if not await self._wait_s04_id_type_radios(page, timeout_ms=timeout_ms):
+            return False
+
+        try:
+            logger.info("s04 勾选证件类型 JS type=%s", id_type)
+            ok = await self._evaluate_capped(
+                page,
+                """([labels, idType, maxLen]) => {
+                    const root = document.body || document.documentElement;
+                    if (!root) return false;
+                    const labs = labels || [];
+                    const wrappers = [...root.querySelectorAll(
+                        '.ant-radio-wrapper, label.ant-radio-wrapper, label'
+                    )];
+                    const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+                    for (const lab of labs) {
+                        for (const w of wrappers) {
+                            const t = norm(w.innerText || '');
+                            if (!t || t.length > maxLen) continue;
+                            if (/请选择|請選擇/.test(t) && t.length > 40) continue;
+                            if (!t.includes(lab)) continue;
+                            if (idType === 'PASSPORT' && /身分證|身分证|身份证/.test(t)) continue;
+                            if (idType === 'HKID' && /中華|中华|人民/.test(t)) continue;
+                            if (idType === 'PRC_ID' && /香港/.test(t)) continue;
+                            w.scrollIntoView({ block: 'center' });
+                            const inner = w.querySelector(
+                                '.ant-radio, .ant-radio-input, span.ant-radio'
+                            );
+                            if (inner) inner.click();
+                            w.click();
+                            const inp = w.querySelector('input[type=radio]');
+                            if (inp) {
+                                inp.checked = true;
+                                inp.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                                inp.dispatchEvent(new Event('input', { bubbles: true }));
+                                inp.dispatchEvent(new Event('change', { bubbles: true }));
+                            }
+                            return lab;
+                        }
+                    }
+                    return '';
+                }""",
+                [list(labels), id_type, _S04_RADIO_LABEL_MAX],
+                timeout_ms=_S04_LOCATOR_MS * 2,
+            )
+            if ok:
+                logger.info("已勾选身份证明类型: %s (%s)", id_type, ok)
+                await page.wait_for_timeout(400)
+                return True
+        except Exception as exc:
+            logger.warning("s04 证件类型 JS 选择失败: %s", exc)
+
+        try:
+            logger.info("s04 勾选证件类型 Playwright type=%s", id_type)
+            for lab in labels:
+                wrappers = page.locator(
+                    ".ant-radio-wrapper, label.ant-radio-wrapper"
+                ).filter(has_text=lab)
+                try:
+                    n = await wrappers.count()
+                except Exception:
+                    continue
+                for i in range(n):
+                    item = wrappers.nth(i)
+                    try:
+                        if not await item.is_visible():
+                            continue
+                        txt = (
+                            await item.inner_text(timeout=_S04_LOCATOR_MS)
+                        ).strip().replace("\n", " ")
+                    except Exception:
+                        continue
+                    if len(txt) > _S04_RADIO_LABEL_MAX:
+                        continue
+                    if re.search(r"請選擇|请选择", txt) and len(txt) > 40:
+                        continue
+                    if id_type == "PASSPORT" and (
+                        "身分證" in txt or "身分证" in txt or "身份证" in txt
+                    ):
+                        continue
+                    if id_type == "HKID" and (
+                        "中華" in txt or "中华" in txt or "人民" in txt
+                    ):
+                        continue
+                    if id_type == "PRC_ID" and ("香港" in txt):
+                        continue
+                    try:
+                        await item.scroll_into_view_if_needed(timeout=_S04_LOCATOR_MS)
+                        await item.click(timeout=_S04_LOCATOR_MS)
+                        await page.wait_for_timeout(400)
+                        logger.info("已勾选身份证明类型: %s (%s)", id_type, lab)
+                        return True
+                    except Exception as exc:
+                        logger.debug("身份证明类型点击失败 %s: %s", lab, exc)
+                        try:
+                            inp = item.locator("input[type='radio']").first
+                            if await inp.count() > 0:
+                                await inp.check(force=True, timeout=_S04_LOCATOR_MS)
+                                await page.wait_for_timeout(300)
+                                logger.info(
+                                    "已 force 勾选身份证明类型: %s (%s)", id_type, lab
+                                )
+                                return True
+                        except Exception:
+                            pass
+        except Exception as exc:
+            logger.warning("s04 证件类型 Playwright 选择失败: %s", exc)
+
+        try:
+            logger.info("s04 勾选证件类型 JS正则 type=%s", id_type)
+            ok = await self._evaluate_capped(
+                page,
+                """([pat, idType, maxLen]) => {
+                    const root = document.body || document.documentElement;
+                    if (!root) return '';
+                    let re;
+                    try { re = new RegExp(pat, 'i'); } catch (e) { return ''; }
+                    const wrappers = [...root.querySelectorAll(
+                        '.ant-radio-wrapper, label.ant-radio-wrapper, label'
+                    )];
+                    const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+                    for (const w of wrappers) {
+                        const t = norm(w.innerText || '');
+                        if (!t || t.length > maxLen) continue;
+                        if (/请选择|請選擇/.test(t) && t.length > 40) continue;
+                        if (!re.test(t)) continue;
+                        if (idType === 'PASSPORT' && /身分證|身分证|身份证/.test(t)) continue;
+                        if (idType === 'HKID' && /中華|中华|人民/.test(t)) continue;
+                        if (idType === 'PRC_ID' && /香港/.test(t)) continue;
+                        w.scrollIntoView({ block: 'center' });
+                        const inner = w.querySelector(
+                            '.ant-radio, .ant-radio-input, span.ant-radio'
+                        );
+                        if (inner) inner.click();
+                        w.click();
+                        const inp = w.querySelector('input[type=radio]');
+                        if (inp) {
+                            inp.checked = true;
+                            inp.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                            inp.dispatchEvent(new Event('input', { bubbles: true }));
+                            inp.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        return t.slice(0, 40);
+                    }
+                    return '';
+                }""",
+                [id_type_pat, id_type, _S04_RADIO_LABEL_MAX],
+                timeout_ms=_S04_LOCATOR_MS * 2,
+            )
+            if ok:
+                logger.info("已按正则勾选身份证明类型: %s (%s)", id_type, ok)
+                await page.wait_for_timeout(400)
+                return True
+        except Exception as exc:
+            logger.warning("s04 证件类型正则选择失败: %s", exc)
+        return False
+
+    async def _fill_s04_hkid_pair(
+        self, page: "Page", main: str, check: str
+    ) -> bool:
+        """s04 港证：第一框主体、括号内第二框校验位。禁止整串含括号写入第一框。"""
+        main = (main or "").strip()
+        check = (check or "").strip()
+        if not main:
+            return False
+        ok = await page.evaluate(
+            """({ main, check }) => {
+                const setNative = (el, v) => {
+                    const setter = Object.getOwnPropertyDescriptor(
+                        HTMLInputElement.prototype, 'value'
+                    ).set;
+                    el.focus();
+                    setter.call(el, v);
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                };
+                const vis = (el) => {
+                    if (!el || el.disabled) return false;
+                    const t = (el.getAttribute('type') || 'text').toLowerCase();
+                    if (['hidden','radio','checkbox','file','submit','button'].includes(t))
+                        return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                };
+                const textInputs = (root) => [...(root || document).querySelectorAll(
+                    'input:not([disabled])'
+                )].filter(vis);
+
+                const markers = [...document.querySelectorAll(
+                    'label, span, div, td, th, p, li, .ant-radio-wrapper'
+                )];
+                let block = null;
+                for (const el of markers) {
+                    const t = (el.innerText || '').replace(/\\s+/g, '');
+                    if (!t || t.length > 60) continue;
+                    if (!/香港身分[證证証]號碼|香港身份[證证]号码/.test(t)) continue;
+                    let n = el;
+                    for (let i = 0; i < 10 && n; i++) {
+                        const found = textInputs(n);
+                        if (found.length >= 2) { block = n; break; }
+                        if (found.length >= 1 && !block) block = n;
+                        n = n.parentElement;
+                    }
+                    if (block && textInputs(block).length >= 1) break;
+                }
+                const inputs = textInputs(block || document.body);
+                if (!inputs.length) return false;
+                const pair = inputs.length >= 2 ? inputs.slice(0, 2) : [inputs[0]];
+                setNative(pair[0], main);
+                if (check && pair[1]) setNative(pair[1], check);
+                return pair[0].value === main && (
+                    !check || !pair[1] || pair[1].value === check
+                );
+            }""",
+            {"main": main, "check": check},
+        )
+        if ok:
+            logger.info("s04 港证已拆填 main=%s check=%s", main, check)
+            return True
+        loc = page.locator(
+            "xpath=//label[contains(.,'香港身分證') or contains(.,'香港身分证')"
+            " or contains(.,'香港身份证')]"
+            "/following::input[not(@type='hidden') and not(@type='radio')"
+            " and not(@type='checkbox') and not(@type='file')]"
+        )
+        try:
+            n = await loc.count()
+            if n >= 1:
+                await loc.nth(0).fill(main)
+                await loc.nth(0).dispatch_event("input")
+                await loc.nth(0).dispatch_event("change")
+                if check and n >= 2:
+                    await loc.nth(1).fill(check)
+                    await loc.nth(1).dispatch_event("input")
+                    await loc.nth(1).dispatch_event("change")
+                logger.info("s04 港证 xpath 已拆填 main=%s check=%s", main, check)
+                return True
+        except Exception as exc:
+            logger.warning("s04 港证拆填失败: %s", exc)
+        return False
+
+    async def _fill_s04_single_number(self, page: "Page", number: str) -> bool:
+        """s04 内地证/护照：整号填一个框。"""
+        number = (number or "").strip()
+        if not number:
+            return False
+        for pat in (
+            r"護照號碼|护照号码|身分證號碼|身份证号码|證件號碼|证件号码",
+            r"號碼|号码|Number|Passport",
+        ):
+            if await self._fill_by_placeholder(page, pat, number):
+                return True
+            if await self._fill_enabled_field_by_label(page, pat, number):
+                return True
+        for sel in (
+            "input[name*='idNo' i]",
+            "input[id*='idNo' i]",
+            "input[name*='idNum' i]",
+            "input[name*='passport' i]",
+            "input[placeholder*='號碼' i]",
+            "input[placeholder*='号码' i]",
+        ):
+            if await self._fill_native_input(page, sel, number):
+                return True
+        return False
+
+    async def _select_s04_passport_country(self, page: "Page", iso3: str) -> bool:
+        """s04 护照：選護照簽發國家／地區（与 s03 非香港住址同一套 ICRIS 选项）。"""
+        from src.materials.countries import icris_country_select_candidates
+
+        kws = [
+            "護照簽發國家",
+            "护照签发国家",
+            "護照簽發國家／地區",
+            "護照簽發國家/地區",
+            "护照签发国家/地区",
+            "护照签发国家／地区",
+            "護照簽發",
+            "护照签发",
+        ]
+        options = tuple(icris_country_select_candidates(iso3 or "CHN"))
+        await page.wait_for_timeout(_FORM_PAUSE_MS)
+        for option in options:
+            if await self._select_ant_select_by_keywords(page, kws, option):
+                logger.info("s04 护照签发国已选: %s iso=%s", option, iso3)
+                return True
+        for option in options:
+            if await self._select_dropdown_by_rowtitle_playwright(page, kws, option):
+                logger.info("s04 护照签发国兜底已选: %s iso=%s", option, iso3)
+                return True
+        logger.warning("s04 护照签发国未选中 iso=%s options=%s", iso3, options[:4])
+        return False
+
+    async def _fill_identity_proof_step(self, page: "Page", data: dict[str, Any]) -> int:
+        """填写身份证明（s04）：证件类型 / 号码 / 证明文件提交方式"""
+        if self._identity_proof_filled and await self._is_identity_proof_step(page):
+            logger.info("s04 已填写过，跳过重复填写")
+            return 0
+
+        if not await self._is_identity_proof_step(page):
+            await self._recover_step_or_restart(
+                page, self._is_identity_proof_step, label="s04身份证明"
+            )
+
+        # s04 勿再切语言/URL 重载
+        if not await self._wait_spin_clear(page, timeout_ms=_STEP_READY_MS):
+            raise IcrisLoadingTimeoutError(register_loading_timeout_message("s04"))
+        await self._dismiss_cookie_banner(page)
+        proof = self._derive_identity_proof(data)
+        logger.info(
+            "开始填写身份证明 (type=%s, submission=%s, url=%s)",
+            proof["id_type"],
+            proof["submission_method"],
+            page.url[:120],
+        )
+
+        filled = 0
+
+        try:
+            type_ok = await self._select_identity_id_type_radio(
+                page, proof["id_type"], proof["id_type_pat"]
+            )
+        except (IcrisLoadingTimeoutError, IcrisFlowError):
+            raise
+        except Exception as exc:
+            logger.warning("勾选身份证明类型异常 type=%s: %s", proof["id_type"], exc)
+            type_ok = False
+        if type_ok:
+            filled += 1
+            if not await self._wait_spin_clear(page, timeout_ms=_STEP_READY_MS):
+                raise IcrisLoadingTimeoutError(register_loading_timeout_message("s04"))
+            await page.wait_for_timeout(500)
+        else:
+            logger.warning(
+                "未能勾选身份证明类型 type=%s pat=%s",
+                proof["id_type"],
+                proof["id_type_pat"],
+            )
+            return filled
+
+        # 选择证件类型后出现号码输入框：港证拆两框，护照填号+签发国，内地证整号
+        id_ok = False
+        fill_plan = s04_identity_fill_values(
+            proof["id_type"],
+            proof["id_number"],
+            str(proof.get("issuing_country") or ""),
+        )
+        if fill_plan["id_type"] == "HKID":
+            id_ok = await self._fill_s04_hkid_pair(
+                page, fill_plan["hkid_main"], fill_plan["hkid_check"]
+            )
+        else:
+            id_ok = await self._fill_s04_single_number(page, fill_plan["number"])
+            if fill_plan["id_type"] == "PASSPORT":
+                if await self._select_s04_passport_country(
+                    page, fill_plan["passport_country_iso"] or "CHN"
+                ):
+                    filled += 1
+        if id_ok:
+            filled += 1
+            logger.info("身份证明号码已填写 type=%s", fill_plan["id_type"])
+            await self._wait_spin_clear(page, timeout_ms=_STEP_READY_MS)
+            await self._raise_if_id_already_registered(page)
+            await self._raise_if_format_invalid(page, step="s04")
+        else:
+            logger.debug("未找到身份证明号码输入框（部分类型可能无需填写）")
+
+        if await self._click_radio_by_text(page, proof["submission_pat"]):
+            filled += 1
+            await page.wait_for_timeout(400)
+
+        if proof["submission_method"] not in ("in_person", "onsite", "person"):
+            if await self._click_radio_by_text(page, proof["online_pat"]):
+                filled += 1
+                logger.info("已选择网上提交子项: certified_copy/digital")
+                await page.wait_for_timeout(500)
+            else:
+                logger.warning("未能选择网上提交子项（数码证书/经核证副本）")
+
+            # 经核证真实副本 → 上传桌面身份证照片
+            if proof.get("online_method") not in ("digital", "digital_cert", "cert"):
+                n = await self._upload_identity_documents(
+                    page, list(proof.get("document_files") or [])
+                )
+                if n:
+                    filled += n
+                    # 等待上传真正完成（antd upload list 无 uploading 项）再点继续
+                    await self._wait_identity_upload_complete(page, timeout_ms=30000)
+                else:
+                    logger.warning("身份证明文件未上传成功")
+
+        logger.info("身份证明已填写 %d 项", filled)
+        if filled > 0:
+            self._identity_proof_filled = True
+            if await self._advance_from_identity_to_esubmit(page):
+                await self._log_page(page, "身份证明继续后")
+            else:
+                logger.warning(
+                    "身份证明填写后未能进入 s03a（仍停在 %s）",
+                    page.url[:120],
+                )
+                await self._raise_if_id_already_registered(page)
+                errs = await self._get_validation_errors(page)
+                if errs:
+                    await self._raise_if_format_invalid(page, errs, step="s04")
+                    logger.warning("s04 校验错误: %s", errs)
+        return filled
+
+    async def _fill_registration_form(self, page: "Page", data: dict[str, Any]) -> int:
+        if await self._is_user_info_step(page):
+            return await self._fill_user_info_step(page, data)
+        if await self._is_identity_proof_step(page):
+            return await self._fill_identity_proof_step(page, data)
+
+        if not self._is_registration_page(page.url):
+            logger.warning("跳过填表：当前不在 registration 页面")
+            return 0
+
+        applicant = data.get("applicant", {})
+        username, password = derive_icris_credentials(data)
+        given, surname = latin_english_given_surname(
+            str(applicant.get("name_en") or ""),
+            str(applicant.get("name_cn") or ""),
+        )
+        surname_stored = str(applicant.get("surname_en") or "").strip()
+        given_stored = str(applicant.get("given_en") or "").strip()
+        if s03_skip_english_name(
+            str(applicant.get("director_name") or ""),
+            str(applicant.get("name_cn") or ""),
+            str(applicant.get("name_en") or ""),
+        ):
+            surname, given = "", ""
+        elif surname_stored or given_stored:
+            surname, given = surname_stored, given_stored
+        name_en_fill = f"{surname} {given}".strip() if (surname or given) else ""
+        field_map = [
+            (["title", "salutation", "稱謂"], applicant.get("title", "Mr")),
+            (["surname", "last", "英文姓氏"], surname),
+            (["given", "first", "英文名字"], given),
+            (["nameEn", "englishName", "英文"], name_en_fill),
+            (["nameCh", "chineseName", "中文"], applicant.get("name_cn", "")),
+            (["email", "電郵", "邮箱"], applicant.get("email", "")),
+            (["phone", "telephone", "電話", "电话"], applicant.get("phone", "")),
+            (["idNo", "idNumber", "identity", "身份"], applicant.get("id_number", "")),
+            (["address", "地址"], applicant.get("address", "")),
+            (["hint", "passwordHint"], data.get("password_hint", "")),
+            (["securityAnswer", "answer"], data.get("security_answer", "")),
+        ]
+
+        filled = 0
+        for keywords, value in field_map:
+            if value and await self._fill_field(page, keywords, str(value)):
+                filled += 1
+
+        selects = page.locator("form select:not([disabled])")
+        for i in range(await selects.count()):
+            sel = selects.nth(i)
+            name = (await sel.get_attribute("name") or "").lower()
+            if "idtype" in name or "id_type" in name or "doctype" in name:
+                id_type = self._normalize_icris_id_type(
+                    str(applicant.get("id_type") or ""),
+                    str(applicant.get("id_number") or ""),
+                )
+                labels_by_type = {
+                    "HKID": (id_type, "香港身分證", "香港身分证", "香港身份证"),
+                    "PRC_ID": (id_type, "中华人民共和国", "中華人民共和國"),
+                    "PASSPORT": (id_type, "护照", "護照"),
+                }
+                picked = False
+                for candidate in labels_by_type.get(id_type, (id_type,)):
+                    try:
+                        await sel.select_option(value=candidate)
+                        picked = True
+                        break
+                    except Exception:
+                        try:
+                            await sel.select_option(label=re.compile(candidate, re.I))
+                            picked = True
+                            break
+                        except Exception:
+                            continue
+                if picked:
+                    filled += 1
+                else:
+                    logger.warning("s03 证件类型下拉未选中 type=%s", id_type)
+
+        logger.info("已填写 %d 个注册表单字段", filled)
+        return filled
+
+    async def _click_continue(
+        self, page: "Page", *, expect_step: str | None = None
+    ) -> bool:
+        """点击继续/下一步（多步骤导航，dry_run 也执行）"""
+        if not self._is_registration_page(page.url):
+            return False
+
+        await self._wait_spin_clear(page, timeout_ms=15000)
+
+        continue_pattern = CONTINUE_BTN_RE
+
+        async def _try_click(btn, *, require_text: bool = True) -> bool:
+            if await btn.count() == 0 or not await btn.is_visible():
+                return False
+            try:
+                txt = (await btn.inner_text()).strip()
+            except Exception:
+                txt = (await btn.get_attribute("value") or "").strip()
+            if require_text and txt and not continue_pattern.search(txt):
+                return False
+            try:
+                if await btn.is_disabled():
+                    logger.warning(
+                        "继续按钮不可用: %s",
+                        txt or await btn.get_attribute("class"),
+                    )
+                    return False
+            except Exception:
+                pass
+            current_url = page.url
+            try:
+                await btn.scroll_into_view_if_needed()
+                try:
+                    await btn.click(timeout=8000)
+                except Exception:
+                    await btn.click(force=True, timeout=8000)
+                logger.info("已点击继续: %s", txt or "(submit)")
+                if not await self._wait_after_continue(
+                    page, current_url, expect_step=expect_step
+                ):
+                    return False
+                if self._is_home_or_portal(page.url):
+                    logger.error("点击继续后跳转到首页")
+                    return False
+                return True
+            except (IcrisLoadingTimeoutError, IcrisStepLoadError, IcrisFlowError, IcrisRestartFromS01):
+                raise
+            except Exception as exc:
+                logger.debug("点击继续失败: %s", exc)
+                return False
+
+        expect = (expect_step or "").lower()
+        want_s05 = "s05" in expect
+        if want_s05:
+            danger = page.locator(
+                "button[type='submit'].ant-btn-danger, "
+                "button.ant-btn-danger.primary, "
+                "button.primary.ant-btn.ant-btn-danger"
+            ).last
+            if await _try_click(danger, require_text=True):
+                return True
+            logger.warning("s03a 红色繼續未进入 s05，不再换选择器连点")
+            return False
+
+        # s02 页面继续按钮：button[type=submit].primary（文字「继 续」）
+        submit_continue = page.locator(
+            "button[type='submit'].primary.ant-btn, button[type='submit'].primary"
+        ).last
+        if await _try_click(submit_continue, require_text=False):
+            return True
+
+        continue_buttons = [
+            "button.primary.ant-btn:has-text('继续')",
+            "button.primary.ant-btn:has-text('继 续')",
+            "button.primary.ant-btn:has-text('繼 續')",
+            "button.ant-btn-danger.primary",
+            "button[type='submit'].primary.ant-btn",
+            "button[type='submit'].primary",
+            "button.ant-btn-primary:has-text('继续')",
+            "button.ant-btn-primary:has-text('继 续')",
+            "button.ant-btn-primary:has-text('繼 續')",
+            "button.ant-btn-primary:has-text('Continue')",
+            "button:has-text('继 续')",
+            "button:has-text('繼 續')",
+            "button:has-text('继续')",
+            "button:has-text('Continue')",
+            "button:has-text('下一步')",
+            "button:has-text('Next')",
+            "input[type='submit'][value*='继续' i]",
+            "input[type='submit'][value*='Continue' i]",
+        ]
+
+        scopes = [
+            page.locator("#uam-content, .content-wrapper, .formSection, form").first,
+            page.locator("body"),
+        ]
+
+        for scope in scopes:
+            if await scope.count() == 0:
+                continue
+            for sel in continue_buttons:
+                btn = scope.locator(sel).first
+                if await btn.count() == 0:
+                    btn = page.locator(sel).first
+                if await _try_click(btn):
+                    return True
+
+        role_btn = page.get_by_role("button", name=continue_pattern)
+        if await role_btn.count() > 0:
+            btn = role_btn.last
+            if await _try_click(btn):
+                return not self._is_home_or_portal(page.url)
+
+        ok = await page.evaluate(
+            """() => {
+                const re = /继\\s*续|繼\\s*續|Continue|Next/i;
+                const btns = [...document.querySelectorAll('button, input[type=submit], input[type=button]')];
+                const btn = btns.find(b => re.test((b.innerText || b.value || '').trim()) && !b.disabled);
+                if (!btn) return false;
+                btn.click();
+                return true;
+            }"""
+        )
+        if ok:
+            current_url = page.url
+            logger.info("JS 已点击继续")
+            if not await self._wait_after_continue(
+                page, current_url, expect_step=expect_step
+            ):
+                return False
+            return not self._is_home_or_portal(page.url)
+        return False
+
+    async def _continue_nav_ok(
+        self,
+        page: "Page",
+        previous_url: str,
+        *,
+        want_s04: bool,
+        want_s05: bool = False,
+    ) -> bool:
+        """判断点击继续后是否已完成期望导航（含 spin 已清）。"""
+        if page.is_closed() or self._is_home_or_portal(page.url):
+            return False
+        if await self._is_spinning(page):
+            return False
+        if want_s05:
+            return await self._is_success_step(page)
+        if want_s04:
+            if await self._is_identity_proof_step(page):
+                return True
+            # 离开 s03 且进入其它注册步也算
+            if not self._is_user_info_url(page.url) and re.search(
+                r"registration/s0", (page.url or "").lower()
+            ):
+                return True
+            return False
+        # URL 变化：视为前进成功
+        if page.url != previous_url:
+            return True
+        # SPA 未改 URL：仅当出现「下一步」特征时算成功（避免仍停在原步误判）
+        if await self._is_user_info_step(page):
+            return True
+        if await self._is_identity_proof_step(page):
+            return True
+        if await self._is_esubmit_terms_step(page):
+            return True
+        return False
+
+    async def _wait_after_continue(
+        self,
+        page: "Page",
+        previous_url: str,
+        *,
+        expect_step: str | None = None,
+    ) -> bool:
+        """点击继续后等待切步。s02/s03/s05 未进下一步时不刷新（避免带着 error 冲进下一步）。
+
+        expect_step='s04' 时：仍停在用户资料页不算成功，须等到 s04。
+        expect_step='s05' 时：须进入提交成功页。
+        """
+        expect = (expect_step or "").lower()
+        want_s04 = "s04" in expect
+        want_s05 = "s05" in expect
+        from_s02_s03 = self._is_s02_url(previous_url) or self._is_s03_user_info_url(
+            previous_url
+        )
+        no_reload = want_s05 or want_s04 or from_s02_s03
+
+        async def _ready(p: "Page") -> bool:
+            return await self._continue_nav_ok(
+                p, previous_url, want_s04=want_s04, want_s05=want_s05
+            )
+
+        if await self._wait_step_ready(
+            page,
+            _ready,
+            timeout_ms=_STEP_READY_MS,
+            label="continue后导航",
+            abort_on_validation=True,
+        ):
+            await page.wait_for_timeout(_PAGE_PAUSE_MS)
+            return True
+
+        errs = await self._get_validation_errors(page)
+        if errs:
+            logger.warning(
+                "继续后有校验错误，不刷新重等: %s", errs[:4]
+            )
+            step = self._nav_step_label(expect_step, previous_url)
+            if want_s05:
+                await self._raise_if_id_already_registered(page, errs)
+                await self._raise_if_format_invalid(page, errs, step=step)
+            else:
+                await self._raise_if_rerun_on_page_error(page, errs, step=step)
+            return False
+
+        if no_reload:
+            logger.warning(
+                "点继续后未进入下一步，不刷新 url=%s expect=%s",
+                page.url[:120],
+                expect_step or "",
+            )
+            if not await self._wait_spin_clear(page, timeout_ms=_STEP_READY_MS):
+                step = (
+                    "s05"
+                    if want_s05
+                    else self._nav_step_label(expect_step, previous_url)
+                )
+                raise IcrisLoadingTimeoutError(register_loading_timeout_message(step))
+            return False
+
+        logger.warning(
+            "继续后未在 %dms 内切换步骤，刷新重试 url=%s expect=%s",
+            _STEP_READY_MS,
+            page.url[:120],
+            expect_step or "",
+        )
+        try:
+            await page.reload(wait_until="commit", timeout=45000)
+            await self._wait_spin_clear(page, timeout_ms=_STEP_READY_MS)
+        except Exception as exc:
+            logger.warning("继续后 reload 失败: %s", exc)
+
+        if await self._wait_step_ready(
+            page,
+            _ready,
+            timeout_ms=_STEP_READY_MS,
+            label="continue后导航(reload)",
+            abort_on_validation=True,
+        ):
+            await page.wait_for_timeout(_PAGE_PAUSE_MS)
+            return True
+
+        errs = await self._get_validation_errors(page)
+        if errs:
+            await self._raise_if_rerun_on_page_error(
+                page, errs, step=self._nav_step_label(expect_step, previous_url)
+            )
+
+        if not await self._wait_spin_clear(page, timeout_ms=_STEP_READY_MS):
+            step = self._nav_step_label(expect_step, previous_url)
+            logger.error("继续后 loading 未结束 step=%s", step)
+            raise IcrisLoadingTimeoutError(register_loading_timeout_message(step))
+        if want_s04:
+            logger.debug(
+                "expect s04 仍未到位 url=%s", page.url[:120]
+            )
+        return False
+
+    async def _click_account_profile_continue(self, page: "Page") -> bool:
+        """账户资料填写完成后点击继续"""
+        if not await self._is_account_profile_step(page):
+            return False
+        await dismiss_google_translate(page)
+        logger.info("账户资料填写完成，点击「继续」进入下一步…")
+        return await self._click_continue(page)
+
+    async def _click_next_if_exists(self, page: "Page") -> bool:
+        """兼容旧调用，统一走 _click_continue"""
+        return await self._click_continue(page)
+
+    async def _run_s03a_review_and_submit(self, page: "Page") -> None:
+        """s03a 只走一遍：截图、审核、勾选；允许提交时点红色繼續并等 s05。"""
+        if self._s03a_handled:
+            logger.info("s03a 已处理过，跳过重复审核/勾选")
+            return
+        if not await self._is_esubmit_terms_step(page):
+            return
+        if not self.esubmit_screenshot_path:
+            await self._save_esubmit_screenshot(page)
+        if self.allow_submit and self.job_id:
+            approved = await self._wait_for_review_approval(page)
+            if not approved:
+                logger.warning("s03a 审核未通过/超时，停止流程")
+                raise IcrisFlowError(
+                    "s03a 审核未通过或超时",
+                    screenshot_path=self.esubmit_screenshot_path or "",
+                    no_requeue=True,
+                )
+        await self._accept_esubmit_terms(page, submit=bool(self.allow_submit))
+        self._s03a_handled = True
+
+    async def _run_registration_attempt(
+        self, page: "Page", data: dict[str, Any]
+    ) -> "Page":
+        """单次注册尝试（从导航到填完）。元素不出现时抛 IcrisStepLoadError。"""
+        self._raise_if_cancelled()
+        page = await self._navigate_to_registration(page)
+        if page:
+            self._active_page = page
+        if not page:
+            raise IcrisStepLoadError(
+                "无法进入 ICRIS 注册页（网络或门户会话）"
+            )
+
+        if not await self._ensure_on_registration(page, "注册条款页"):
+            raise IcrisStepLoadError(f"未能停留在注册条款页: {page.url[:160]}")
+
+        # Step 1: 验证码 + 条款（仅在 s01 页），验证码错误时自动刷新重试
+        t_s01 = time.monotonic()
+        await self._dismiss_portal_overlays(page)
+        terms_ok = False
+        for captcha_round in range(1, 4):
+            filled = await self._fill_captcha(page)
+            if not filled:
+                logger.warning("验证码填写失败 (轮次 %d/3)", captcha_round)
+                continue
+
+            terms_ok = await self._accept_terms(page)
+            if terms_ok:
+                break
+
+            logger.warning(
+                "条款页未通过，可能验证码错误，刷新后重试 (轮次 %d/3)",
+                captcha_round,
+            )
+            if captcha_round < 3:
+                from src.browser.icris_captcha import _reload_captcha
+
+                await _reload_captcha(page)
+                if self._is_home_or_portal(page.url):
+                    new_page = await self._navigate_to_registration(page)
+                    if not new_page:
+                        break
+                    page = new_page
+                    self._active_page = page
+                    await self._ensure_on_registration(page, "重新进入条款页")
+
+        if not terms_ok:
+            raise IcrisStepLoadError("条款页处理失败（验证码或条款）")
+        logger.info("ICRIS s01 duration=%.1fs", time.monotonic() - t_s01)
+
+        if not await self._ensure_on_registration(page, "进入注册表单"):
+            raise IcrisStepLoadError(f"进入注册表单失败: {page.url[:160]}")
+
+        t_s02 = time.monotonic()
+        page = await self._recover_step_or_restart(
+            page, self._is_account_profile_step, label="s02账户资料"
+        )
+
+        # Step 2: 账户资料（s02）— 填写后自动点继续
+        if await self._is_account_profile_step(page):
+            logger.info("=== 填写账户资料步骤 ===")
+            await self._fill_user_profile_step(page, data)
+        else:
+            raise IcrisStepLoadError(
+                f"条款通过后未进入账户资料页: {page.url[:160]}"
+            )
+        logger.info("ICRIS s02 duration=%.1fs", time.monotonic() - t_s02)
+
+        # Step 3: 用户资料（s03）
+        t_s03 = time.monotonic()
+        if self._is_s02_url(page.url) and not await self._is_user_info_step(page):
+            await self._raise_restart_if_did_not_advance(
+                page, step="s02", next_step="s03"
+            )
+        page = await self._recover_step_or_restart(
+            page, self._user_info_form_is_ready, label="s03用户资料"
+        )
+        if await self._is_user_info_step(page):
+            logger.info("=== 填写用户资料步骤 ===")
+            await self._fill_user_info_step(page, data)
+        else:
+            raise IcrisStepLoadError(
+                f"账户资料继续后未进入用户资料页: {page.url[:160]}"
+            )
+        logger.info("ICRIS s03 duration=%.1fs", time.monotonic() - t_s03)
+
+        # Step 4: 身份证明（s04）
+        t_s04 = time.monotonic()
+        if not await self._is_identity_proof_step(page):
+            await self._advance_from_user_info_to_identity(page)
+        if await self._is_identity_proof_step(page):
+            page = await self._recover_step_or_restart(
+                page, self._is_identity_proof_step, label="s04身份证明"
+            )
+        elif self._is_s03_user_info_url(page.url) or (
+            await self._is_user_info_step(page)
+            and not self._is_esubmit_terms_url(page.url)
+        ):
+            await self._raise_restart_if_did_not_advance(
+                page, step="s03", next_step="s04"
+            )
+        else:
+            page = await self._recover_step_or_restart(
+                page, self._is_identity_proof_step, label="s04身份证明"
+            )
+        if await self._is_identity_proof_step(page):
+            logger.info("=== 填写身份证明步骤 ===")
+            await self._fill_identity_proof_step(page, data)
+        else:
+            await self._raise_if_missing_registration_step(
+                page, step="s04", label="身份证明页"
+            )
+        logger.info("ICRIS s04 duration=%.1fs", time.monotonic() - t_s04)
+
+        # Step 4b: s03a 电子提交条款（s04 未跳转时再推进一次）
+        t_s03a = time.monotonic()
+        if not await self._wait_spin_clear(page, timeout_ms=_STEP_READY_MS):
+            step = (
+                "s04"
+                if await self._is_identity_proof_step(page)
+                else "s03a"
+            )
+            raise IcrisLoadingTimeoutError(
+                register_loading_timeout_message(step)
+            )
+        if not await self._is_esubmit_terms_step(page):
+            if self._is_identity_proof_url(page.url) or await self._is_identity_proof_step(
+                page
+            ):
+                await self._advance_from_identity_to_esubmit(page)
+        if await self._is_esubmit_terms_step(page):
+            logger.info("=== s03a 电子提交服务条款 ===")
+            await self._run_s03a_review_and_submit(page)
+
+        # Step 5+: 其余多步表单
+        max_steps = 6
+        for step in range(max_steps):
+            if self._is_home_or_portal(page.url):
+                logger.error("步骤 %d 检测到跳转首页，停止", step + 5)
+                break
+            # s05 成功页：直接退出循环，交由末尾截图逻辑处理（避免误点继续）
+            if await self._is_success_step(page):
+                logger.info("步骤 %d 检测到 s05 成功页，退出步骤循环", step + 5)
+                break
+            if self._s03a_handled:
+                if not self.allow_submit:
+                    break
+                if await self._wait_step_ready(
+                    page,
+                    self._is_success_step,
+                    timeout_ms=_STEP_READY_MS,
+                    label="s05",
+                ):
+                    break
+                if self._is_success_page_url(page.url):
+                    # URL 已在 s05：提交已发出，按成功处理（文案可能未渲染）
+                    logger.info(
+                        "s03a 点继续后 URL 已在 s05，按成功处理: %s", page.url[:120]
+                    )
+                    break
+                if await self._is_esubmit_terms_step(page):
+                    # 仍在条款页：提交点击未生效，可重跑
+                    raise IcrisStepLoadError(
+                        f"s03a 点继续后未进入提交成功页: {page.url[:160]}"
+                    )
+                # 页面去向不明（可能已提交成功）：不自动重跑，避免撞「已登记」
+                raise IcrisFlowError(
+                    "s03a 点继续后页面去向不明，需人工核对是否已提交: "
+                    f"{page.url[:160]}",
+                    no_requeue=True,
+                )
+            if await self._is_esubmit_terms_step(page):
+                logger.info("=== s03a 电子提交服务条款（步骤循环）===")
+                await self._run_s03a_review_and_submit(page)
+                if not await self._wait_spin_clear(page, timeout_ms=_STEP_READY_MS):
+                    raise IcrisLoadingTimeoutError(
+                        register_loading_timeout_message("s03a")
+                    )
+                continue
+            if await self._is_identity_proof_step(page):
+                if self._identity_proof_filled:
+                    logger.info("仍在 s04 但已填过，尝试进入 s03a")
+                    if not await self._advance_from_identity_to_esubmit(page):
+                        await self._raise_if_missing_registration_step(
+                            page, step="s03a", label="电子提交条款页"
+                        )
+                    continue
+                else:
+                    await self._fill_identity_proof_step(page, data)
+            elif await self._is_user_info_step(page):
+                if self._user_info_filled:
+                    logger.info(
+                        "仍在 s03 但已填过，仅尝试进入 s04（不切语言重载）"
+                    )
+                    if not await self._advance_from_user_info_to_identity(page):
+                        await self._raise_if_missing_registration_step(
+                            page, step="s04", label="身份证明页"
+                        )
+                    continue
+                await self._fill_user_info_step(page, data)
+            elif await self._is_account_profile_step(page):
+                await self._fill_user_profile_step(page, data)
+            else:
+                logger.info("处理注册表单步骤 %d", step + 5)
+                filled = await self._fill_registration_form(page, data)
+                if filled == 0 and step > 0:
+                    break
+                if not await self._click_continue(page):
+                    break
+            await self._wait_spin_clear(page, timeout_ms=_STEP_READY_MS)
+            if not await self._ensure_on_registration(page, f"步骤{step + 5}后"):
+                break
+
+        # 末尾再处理一次 s03a（仅尚未处理时）
+        if await self._is_esubmit_terms_step(page) and not self._s03a_handled:
+            logger.info("=== s03a 电子提交服务条款（流程末尾）===")
+            await self._run_s03a_review_and_submit(page)
+        elif (
+            not self._s03a_handled
+            and not await self._is_success_step(page)
+            and not await self._is_esubmit_terms_step(page)
+        ):
+            submit_btns = page.locator(
+                "form input[type='submit'], form button[type='submit']"
+            )
+            if await submit_btns.count() > 0:
+                if self.allow_submit:
+                    logger.warning(
+                        "即将点击 ICRIS 最终提交（DRY_RUN=false, ICRIS_ALLOW_SUBMIT=true）"
+                    )
+                    await submit_btns.first.click(timeout=15000)
+                    await self._wait_spin_clear(page, timeout_ms=30000)
+                    logger.warning("已点击 ICRIS 最终提交按钮")
+                else:
+                    logger.info(
+                        "检测到提交按钮，未点击（dry_run=%s icris_allow_submit=%s）",
+                        self.dry_run,
+                        settings.icris_allow_submit,
+                    )
+
+        logger.info("ICRIS s03a duration=%.1fs", time.monotonic() - t_s03a)
+
+        # s05 成功页：等加载完成并截图存档（不依赖 allow_submit）
+        t_s05 = time.monotonic()
+        if self._is_success_page_url(page.url) or await self._is_success_step(page):
+            logger.info("=== s05 提交成功确认页 ===")
+            await self._save_success_screenshot(page)
+        logger.info("ICRIS s05 duration=%.1fs", time.monotonic() - t_s05)
+
+        if self.allow_submit:
+            if not await self._is_success_step(page):
+                if self.success_screenshot_path:
+                    # s05 成功截图已存：提交已成功，页面后续跳走不影响结果
+                    logger.warning(
+                        "s05 重查未见到成功页，但成功截图已存，按成功收尾: %s",
+                        page.url[:120],
+                    )
+                else:
+                    await self._raise_if_missing_registration_step(
+                        page, step="s05", label="提交成功页"
+                    )
+            logger.info("注册表单填写完成（已按开关尝试提交）")
+        else:
+            if await self._is_success_step(page):
+                # 未允许提交但页面已进入 s05（如审核后状态残留/人工干预）：按实际结果收尾
+                logger.info("注册表单填写完成（页面已进入 s05 成功页）")
+                return page
+            if not await self._is_esubmit_terms_step(page):
+                await self._raise_if_missing_registration_step(
+                    page, step="s03a", label="电子提交条款页"
+                )
+            await self._raise_if_nav_loading_timeout(page, step="s03a")
+            logger.info("注册表单填写完成（未提交）")
+        return page
+
+    def _exhausted_page_error(self, restart: BaseException) -> IcrisFlowError:
+        shot = (
+            self.error_screenshot_path
+            or getattr(restart, "screenshot_path", "")
+            or ""
+        )
+        return IcrisFlowError(
+            f"页面报错已整段重跑一次仍未成功: {str(restart)[:160]}",
+            screenshot_path=shot,
+            no_requeue=True,
+        )
+
+    async def _prepare_fresh_page_after_page_error(
+        self, page: "Page", data: dict[str, Any]
+    ) -> "Page":
+        """页面报错重跑：截图、换用户名清审核、关闭旧标签并新开页（从门户重进 s01）。"""
+        if not self.error_screenshot_path:
+            await self._save_error_screenshot(page)
+        self._prepare_registration_rerun(data)
+        try:
+            if not page.is_closed():
+                await page.close()
+        except Exception:
+            logger.debug("关闭报错标签页失败", exc_info=True)
+        new_page = await page.context.new_page()
+        self._active_page = new_page
+        logger.info("已关闭报错标签页，新开页面准备从 s01 重跑")
+        return new_page
+
+    def _prepare_registration_rerun(self, data: dict[str, Any]) -> None:
+        """第二遍：清步骤标志、换用户名、清审核，必须再走 s03a 人工审核。"""
+        self._reset_flow_flags()
+        self.esubmit_screenshot_path = ""
+        self._registration_rerun = True
+        self._regen_s02_username(data)
+        self._persist_s02_account_to_job(data)
+        if not self.job_id:
+            return
+        try:
+            from src.storage.db import ExternalGroupStore
+
+            ExternalGroupStore().reset_job_review_for_rerun(self.job_id)
+        except Exception as exc:
+            logger.warning("重跑前清审核状态失败: %s", exc)
+
+    async def _run_attempt_with_s03a_rerun(
+        self, page: "Page", data: dict[str, Any]
+    ) -> "Page":
+        """页面报错时关页重开整段再跑一次；第二次仍失败则不再排队。"""
+        self._reset_flow_flags()
+        self._registration_rerun = False
+        try:
+            return await self._run_registration_attempt(page, data)
+        except IcrisRestartFromS01 as restart:
+            logger.warning(
+                "页面报错，关闭当前标签页从 s01 整段重跑一次（到 s03a 须再审核）: %s",
+                restart,
+            )
+            page = await self._prepare_fresh_page_after_page_error(page, data)
+            try:
+                return await self._run_registration_attempt(page, data)
+            except IcrisRestartFromS01 as restart2:
+                raise self._exhausted_page_error(restart2) from restart2
+
+    async def run(
+        self,
+        data: dict[str, Any],
+        *,
+        force_isolated_browser: bool = False,
+    ) -> None:
+        """执行注册流程：打开浏览器 → 验证码 → 条款 → 填写表单（按开关提交）"""
+        self._company_data = data if isinstance(data, dict) else {}
+        try:
+            from src.browser.launcher import import_async_playwright
+
+            async_playwright = import_async_playwright()
+        except RuntimeError:
+            raise
+        except ImportError as e:
+            raise RuntimeError(
+                "请先安装 Playwright: pip install playwright && playwright install chromium"
+            ) from e
+
+        keep_open = max(0, int(settings.browser_keep_open_seconds or 0))
+
+        async with async_playwright() as p:
+            browser = await launch_browser(
+                p, force_isolated=force_isolated_browser
+            )
+            context = await create_browser_context(browser)
+            page = await context.new_page()
+            self._active_page = page
+            run_error: Exception | None = None
+            cancel_watch = (
+                asyncio.create_task(self._abort_page_if_cancelled())
+                if self.job_id
+                else None
+            )
+
+            try:
+                self._raise_if_cancelled()
+                page = await self._run_attempt_with_s03a_rerun(page, data)
+                self._active_page = page
+
+            except Exception as e:
+                if self._job_is_cancelled():
+                    run_error = IcrisFlowError("任务已被取消", no_requeue=True)
+                    run_error.__cause__ = e
+                    logger.warning("注册流程因取消中止 job #%s: %s", self.job_id, e)
+                elif self._job_is_rejected():
+                    run_error = IcrisFlowError(
+                        "s03a 审核未通过或超时",
+                        screenshot_path=self.esubmit_screenshot_path or "",
+                        no_requeue=True,
+                    )
+                    run_error.__cause__ = e
+                    logger.warning(
+                        "注册流程因审核拒绝中止 job #%s: %s", self.job_id, e
+                    )
+                else:
+                    run_error = e
+                    logger.exception("注册流程异常: %s", e)
+                    screenshot_path = (
+                        self.error_screenshot_path
+                        or getattr(e, "screenshot_path", "")
+                        or ""
+                    )
+                    if not screenshot_path:
+                        try:
+                            from config.settings import PROJECT_ROOT
+
+                            shot_dir = PROJECT_ROOT / "data" / "icris_failures"
+                            shot_dir.mkdir(parents=True, exist_ok=True)
+                            from datetime import datetime, timezone
+
+                            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                            shot_file = shot_dir / f"job_fail_{stamp}.png"
+                            if not page.is_closed():
+                                await page.screenshot(path=str(shot_file), full_page=True)
+                                screenshot_path = str(shot_file)
+                                logger.warning("ICRIS 失败截图已保存: %s", screenshot_path)
+                        except Exception as shot_err:
+                            logger.warning("保存失败截图失败: %s", shot_err)
+                    if screenshot_path:
+                        # 注意：失败截图只进 screenshot_path，绝不能覆盖
+                        # success_screenshot_path（只存真实 s05 成功图），
+                        # 否则后台「成功截图」列会把失败图当成功图展示。
+                        if isinstance(e, IcrisFlowError):
+                            if not e.screenshot_path:
+                                e.screenshot_path = screenshot_path
+                            run_error = e
+                        else:
+                            run_error = IcrisFlowError(
+                                str(e), screenshot_path=screenshot_path
+                            )
+                            run_error.__cause__ = e
+                    # 若异常前已存真实 s05 成功图（罕见：截图后页面跳走），
+                    # 透传给 worker 落库，避免成功图丢失。
+                    real_success_shot = (self.success_screenshot_path or "").strip()
+                    if real_success_shot and run_error is not None:
+                        try:
+                            run_error.success_screenshot_path = real_success_shot
+                        except Exception:
+                            pass
+            finally:
+                if cancel_watch:
+                    cancel_watch.cancel()
+                    try:
+                        await cancel_watch
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                # 失败或取消：立即关闭，不占用 CDP
+                skip_keep_open = run_error is not None or self._job_is_cancelled()
+                if skip_keep_open:
+                    logger.info("注册失败/取消，立即关闭浏览器")
+                elif keep_open <= 0:
+                    logger.info("注册成功，不保持打开浏览器")
+                else:
+                    logger.info("浏览器保持打开 %d 秒供检查…", keep_open)
+                    remaining = float(keep_open)
+                    while remaining > 0 and not self._job_is_cancelled():
+                        step = min(1.0, remaining)
+                        try:
+                            await page.wait_for_timeout(int(step * 1000))
+                        except Exception:
+                            break
+                        remaining -= step
+                # 任务结束必释放整个浏览器（含 CDP 9222），避免残留影响下一个任务
+                try:
+                    await browser.close()
+                    logger.info("浏览器已关闭释放")
+                except Exception as exc:
+                    logger.warning("关闭浏览器失败: %s", exc)
+
+            if run_error:
+                raise run_error

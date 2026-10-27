@@ -1,0 +1,66 @@
+# 示例：HTTPS 反代
+# - 企微回调 / health → 本机 8081（wework-external-bot 或 docker compose 服务 bot）
+# - 管理后台 /admin → 本机 8082（python main.py admin 或 compose 服务 admin）
+# Docker 部署见 deploy/DOCKER.md；将 szyingtai.cn 换成你的域名；证书路径按实际修改。
+
+upstream finance_ai_wework {
+    server 127.0.0.1:8081;
+    keepalive 8;
+}
+
+upstream finance_ai_admin {
+    server 127.0.0.1:8082;
+    keepalive 4;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name szyingtai.cn;
+
+    ssl_certificate     /etc/nginx/ssl/fullchain.pem;
+    ssl_certificate_key /etc/nginx/ssl/privkey.pem;
+
+    # 企微回调（生产必须 HTTPS）
+    location /webhook {
+        proxy_pass http://finance_ai_wework;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 60s;
+    }
+
+    location /wework/external/callback {
+        proxy_pass http://finance_ai_wework;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Agent 探活（勿把公网 /admin 裸暴露）
+    location /health {
+        proxy_pass http://finance_ai_wework;
+        access_log off;
+    }
+
+    # 管理后台（独立进程 ADMIN_PORT=8082；建议仅内网或 IP 白名单）
+    # 宝塔：网站 → 反向代理，目标 http://127.0.0.1:8082 ，路径 /admin
+    location /admin {
+        # allow 10.0.0.0/8;
+        # deny all;
+        proxy_pass http://finance_ai_admin;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Authorization $http_authorization;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+server {
+    listen 80;
+    server_name szyingtai.cn;
+    return 301 https://$host$request_uri;
+}
